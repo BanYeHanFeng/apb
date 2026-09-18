@@ -4,9 +4,11 @@ name: 构建与发布
 #   - push main / PR / 手动触发（不填 tag）：运行测试 + 静态构建；
 #   - push main 且提交标题严格匹配 `发布: vxxx`（例如 `发布: v0.1.1`）：
 #     构建并发布 latest 正式版，必要时自动创建 tag `v0.1.1`；
+#   - push main 且提交标题不是上述发布格式：
+#     构建并更新唯一的预发布 Release（固定 tag `pre-release`，不会创建新的 tag / Release）；
 #   - 推送 v* tag（例如 `git tag v0.1.1 && git push origin v0.1.1`）：
 #     构建并发布 latest 正式版；
-#   - 手动触发 workflow_dispatch 并填写 tag：发布对应标签。
+#   - 手动触发 workflow_dispatch 并填写 tag：发布对应标签；留空则只构建不发布。
 on:
   push:
     branches: [ main ]
@@ -34,10 +36,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      should_release: ${{ steps.detect.outputs.should_release }}
+      should_publish: ${{ steps.detect.outputs.should_publish }}
+      release_type: ${{ steps.detect.outputs.release_type }}
       tag: ${{ steps.detect.outputs.tag }}
+      release_name: ${{ steps.detect.outputs.release_name }}
+      prerelease: ${{ steps.detect.outputs.prerelease }}
     steps:
-      - name: 判断触发方式并生成 tag
+      - name: 判断触发方式并生成发布信息
         id: detect
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -45,21 +50,34 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ github.event.inputs.tag || '' }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message || '' }}
+          # 固定预发布 tag，runApb.sh 的 --pre 也默认从该 tag 下载
+          PRERELEASE_TAG: pre-release
         run: |
-          should_release=false
+          should_publish=false
+          release_type=""
           tag=""
+          release_name=""
+          is_prerelease=false
 
           case "$EVENT_NAME" in
             workflow_dispatch)
               tag="${INPUT_TAG#refs/tags/}"
               if [ -n "$tag" ]; then
-                should_release=true
+                should_publish=true
+                release_type="stable"
+                release_name="$tag"
+                echo "将发布正式版：$tag"
+              else
+                echo "手动触发未填写 tag，跳过发布，只构建产物"
               fi
               ;;
             push)
               if [ "$REF_TYPE" = "tag" ]; then
                 tag="$REF_NAME"
-                should_release=true
+                should_publish=true
+                release_type="stable"
+                release_name="$tag"
+                echo "将发布正式版：$tag"
               else
                 # 只取提交标题（commit message 第一行），并去掉首尾空白
                 title="${COMMIT_MESSAGE%%$'\n'*}"
@@ -67,19 +85,36 @@ jobs:
                 title="${title%"${title##*[![:space:]]}"}"
                 if [[ "$title" =~ ^发布:[[:space:]]+v([0-9][0-9A-Za-z._-]*)$ ]]; then
                   tag="v${BASH_REMATCH[1]}"
-                  should_release=true
+                  should_publish=true
+                  release_type="stable"
+                  release_name="$tag"
+                  echo "提交标题匹配发布格式，将发布正式版：$tag"
                 else
-                  echo "提交标题不匹配 发布: vxxx，跳过发布：${title}"
+                  # 非正式版推送：只更新同一个预发布 Release，不新建 tag / Release
+                  should_publish=true
+                  release_type="prerelease"
+                  tag="$PRERELEASE_TAG"
+                  release_name="预发布（滚动构建）"
+                  is_prerelease=true
+                  echo "提交标题未匹配发布格式，将更新预发布 Release：$tag"
+                  echo "预发布 Release 只保留这一个，本次会覆盖其中的静态二进制"
+                  echo "本次提交：${GITHUB_SHA:-unknown}"
+                  echo "提交标题：${title:-（空）}"
                 fi
               fi
               ;;
+            *)
+              echo "事件 $EVENT_NAME 不发布，只构建产物"
+              ;;
           esac
 
-          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if [ "$should_release" = "true" ]; then
-            echo "将发布正式版：$tag"
-          fi
+          {
+            echo "should_publish=$should_publish"
+            echo "release_type=$release_type"
+            echo "tag=$tag"
+            echo "release_name=$release_name"
+            echo "prerelease=$is_prerelease"
+          } >> "$GITHUB_OUTPUT"
 
   test:
     name: 测试（本机）
@@ -151,11 +186,15 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: 发布正式版
+    name: 发布（正式版 / 预发布）
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [ detect, test, build ]
-    if: needs.detect.outputs.should_release == 'true'
+    if: needs.detect.outputs.should_publish == 'true'
+    concurrency:
+      # 同一个 Release tag 的发布任务串行执行，避免快速连续推送时并发更新
+      group: apb-release-${{ needs.detect.outputs.tag }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -164,11 +203,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: 创建 / 更新正式版 Release
+      - name: 创建 / 更新 latest 正式版 Release
+        if: needs.detect.outputs.release_type == 'stable'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.detect.outputs.tag }}
-          name: ${{ needs.detect.outputs.tag }}
+          name: ${{ needs.detect.outputs.release_name }}
           target_commitish: ${{ github.sha }}
           draft: false
           prerelease: false
@@ -176,3 +216,20 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+      - name: 创建 / 更新唯一的预发布 Release
+        if: needs.detect.outputs.release_type == 'prerelease'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.detect.outputs.tag }}
+          name: ${{ needs.detect.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: true
+          make_latest: false
+          body: |
+            推送 `main` 后自动构建的滚动预发布版本，仓库中只保留这一个预发布 Release。
+            后续普通推送会覆盖这里两个静态二进制。
+
+            本次构建提交：`${{ github.sha }}`
+          files: dist/*
+          fail_on_unmatched_files: true

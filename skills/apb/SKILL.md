@@ -46,6 +46,7 @@ APB_SERVER='IP:30020' APB_KEY="$APB_KEY" APB_NAME='phone-a' ./apb agent
 
 # —— 节点一键接入（脚本自动下载二进制并交互询问参数）——
 # bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
+# 交互运行时也会询问 1 正式版 / 2 预发布；非交互可追加 --pre（或设置 APB_CHANNEL=prerelease）
 
 # —— 本机控制 ——
 ./apb status --server IP:30020 --key "$APB_KEY" --json

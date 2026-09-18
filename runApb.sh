@@ -18,7 +18,9 @@
 #   APB_BIN                           已存在的 apb 二进制，设置后跳过下载
 #   APB_BINARY_URL                    直接指定二进制下载地址
 #   APB_REPO                          GitHub 仓库，默认 BanYeHanFeng/apb
-#   APB_VERSION                       Release 版本，默认 latest
+#   APB_CHANNEL                       下载通道，stable（默认）/ prerelease；未设置时交互脚本会询问
+#   APB_PRE_RELEASE_TAG               预发布 Release 标签，默认 pre-release
+#   APB_VERSION                       Release 版本，默认 latest；填写具体 v* 时优先于通道
 #   APB_RELEASE_BASE                  Release 下载页，默认 https://github.com/$APB_REPO/releases
 #   APB_GH_PROXY                      GitHub 加速前缀，按 <前缀>/<完整URL> 拼装
 #   APB_LOG                           后台日志路径，默认可写的临时目录或 HOME 下 apb-agent-<name>.log
@@ -44,6 +46,13 @@ SERVER="${APB_SERVER:-}"
 KEY="${APB_KEY:-}"
 NAME="${APB_NAME:-}"
 TARGET_OVERRIDE="${APB_TARGET:-}"
+CHANNEL="${APB_CHANNEL:-stable}"
+CHANNEL_EXPLICIT=0
+if [ -n "${APB_CHANNEL:-}" ]; then
+  CHANNEL_EXPLICIT=1
+fi
+# 与 .github/workflows/ci.yml 的 PRERELEASE_TAG 保持一致；CI 用它维护唯一的预发布 Release。
+PRE_RELEASE_TAG="${APB_PRE_RELEASE_TAG:-pre-release}"
 VERSION="${APB_VERSION:-latest}"
 RELEASE_BASE="${DEFAULT_RELEASE_BASE%/}"
 GH_PROXY="${APB_GH_PROXY:-}"
@@ -91,9 +100,10 @@ apb 客户端一键脚本
 
 本脚本会:
   1. 检测 Linux 架构（x86_64 / aarch64）；
-  2. 下载对应的静态 apb 到安装目录；
-  3. 交互询问服务端地址、APB_KEY、节点名和运行方式；
-  4. 启动 apb agent（默认后台运行）。
+  2. 交互选择下载通道（1 正式版 / 2 预发布，回车默认正式版；非交互时用选项或环境变量指定）；
+  3. 下载对应的静态 apb 到安装目录；
+  4. 交互询问服务端地址、APB_KEY、节点名和运行方式；
+  5. 启动 apb agent（默认后台运行）。
 
 选项:
   -s, --server IP:PORT   服务端地址，缺省端口 ${DEFAULT_PORT}
@@ -102,6 +112,10 @@ apb 客户端一键脚本
   -b, --background       后台运行（默认）
   -f, --foreground       前台运行，Ctrl+C 停止
   -y, --yes              不交互，使用已有参数 / 默认运行方式；缺少必填项则报错
+  -c, --channel CHANNEL  下载通道：stable 正式版（默认）/ prerelease 预发布
+      --stable           等价于 --channel stable
+      --pre, --prerelease
+                         等价于 --channel prerelease
       --install-only     只下载/校验二进制，不启动 agent
       --update           强制重新下载最新二进制
       --binary PATH      使用已有 apb 二进制，不下载
@@ -115,8 +129,9 @@ apb 客户端一键脚本
 
 示例:
   bash runApb.sh
+  bash runApb.sh --pre
   APB_SERVER=1.2.3.4:30020 APB_KEY=\$(apb keygen) APB_NAME=phone-a \\
-    bash runApb.sh --yes --background
+    APB_CHANNEL=prerelease bash runApb.sh --yes --background
 
 安全提示:
   交互输入的 APB_KEY 不回显，也不会出现在 apb 进程命令行中；密钥只通过环境变量传给 agent。
@@ -126,6 +141,30 @@ EOF
 
 version() {
   printf 'runApb.sh (apb client helper)\n'
+}
+
+normalize_channel() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    stable|release|latest|正式版|正式|稳定版|稳定)
+      printf 'stable'
+      ;;
+    prerelease|pre-release|pre|preview|beta|canary|nightly|edge|预发布版|预发布|预览版|预览)
+      printf 'prerelease'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+channel_name() {
+  if [ "$CHANNEL" = "prerelease" ]; then
+    printf '预发布'
+  else
+    printf '正式版'
+  fi
 }
 
 parse_args() {
@@ -215,6 +254,19 @@ parse_args() {
       --release-base=*)
         RELEASE_BASE="${1#*=}"; RELEASE_BASE="${RELEASE_BASE%/}"; shift
         ;;
+      -c|--channel)
+        [ "$#" -ge 2 ] || die "$1 缺少参数"
+        CHANNEL="$2"; CHANNEL_EXPLICIT=1; shift 2
+        ;;
+      --channel=*)
+        CHANNEL="${1#*=}"; CHANNEL_EXPLICIT=1; shift
+        ;;
+      --stable)
+        CHANNEL="stable"; CHANNEL_EXPLICIT=1; shift
+        ;;
+      --pre|--prerelease)
+        CHANNEL="prerelease"; CHANNEL_EXPLICIT=1; shift
+        ;;
       -h|--help)
         usage; exit 0
         ;;
@@ -247,6 +299,12 @@ parse_args() {
     *) die "APB_BACKGROUND 值无效: $BACKGROUND_MODE" ;;
   esac
   case "$FORCE_UPDATE" in 1|true|TRUE|yes|YES) FORCE_UPDATE=1 ;; *) FORCE_UPDATE=0 ;; esac
+
+  local normalized_channel
+  if ! normalized_channel="$(normalize_channel "$CHANNEL")"; then
+    die "下载通道无效: ${CHANNEL}（可选 stable 正式版 / prerelease 预发布）"
+  fi
+  CHANNEL="$normalized_channel"
 }
 
 trim() {
@@ -289,7 +347,7 @@ validate_binary() {
 }
 
 resolve_binary() {
-  local target="$1" candidate existing=""
+  local target="$1" candidate existing="" mark_file="" existing_channel=""
 
   if [ -n "$BIN_OVERRIDE" ]; then
     BIN_OVERRIDE="$(cd -- "$(dirname -- "$BIN_OVERRIDE")" 2>/dev/null && pwd)/$(basename -- "$BIN_OVERRIDE")"
@@ -306,8 +364,9 @@ resolve_binary() {
     return 0
   fi
 
-  # 优先使用脚本目录 / 当前目录里已经构建好的 apb，方便仓库内直接运行。
-  if [ "$FORCE_UPDATE" -ne 1 ]; then
+  # 默认正式版仍优先使用脚本目录 / 当前目录里已经构建好的 apb，方便仓库内直接运行；
+  # 显式指定下载通道时直接下载对应 Release，避免误用本地与通道不符的构建。
+  if [ "$FORCE_UPDATE" -ne 1 ] && [ "$CHANNEL_EXPLICIT" -ne 1 ]; then
     local -a candidates=()
     [ -n "$SCRIPT_DIR" ] && candidates+=("$SCRIPT_DIR/apb")
     candidates+=("./apb")
@@ -323,9 +382,20 @@ resolve_binary() {
   if [ -n "${DEFAULT_INSTALL_DIR:-}" ]; then
     mkdir -p -- "$DEFAULT_INSTALL_DIR" 2>/dev/null || true
     existing="$DEFAULT_INSTALL_DIR/apb"
-    if [ -z "$FORCE_UPDATE" ] && validate_binary "$existing"; then
-      APB_BIN_PATH="$existing"
-      return 0
+    mark_file="${DEFAULT_INSTALL_DIR%/}/.apb-channel"
+    if [ "$FORCE_UPDATE" -eq 0 ] && validate_binary "$existing"; then
+      if [ -f "$mark_file" ]; then
+        existing_channel="$(cat -- "$mark_file" 2>/dev/null || true)"
+      fi
+      if [ "$existing_channel" = "$CHANNEL" ]; then
+        APB_BIN_PATH="$existing"
+        return 0
+      fi
+      # 兼容旧脚本安装的、没有通道标记的二进制：默认正式版继续复用。
+      if [ -z "$existing_channel" ] && [ "$CHANNEL" = "stable" ] && [ "$CHANNEL_EXPLICIT" -eq 0 ]; then
+        APB_BIN_PATH="$existing"
+        return 0
+      fi
     fi
   fi
 
@@ -345,10 +415,13 @@ download_url_for() {
   asset="apb-${target}"
   if [ -n "$BINARY_URL" ]; then
     url="$BINARY_URL"
-  elif [ "$VERSION" = "latest" ] || [ -z "$VERSION" ]; then
-    url="${RELEASE_BASE}/latest/download/${asset}"
-  else
+  elif [ -n "$VERSION" ] && [ "$VERSION" != "latest" ]; then
+    # 显式指定具体版本时优先于下载通道
     url="${RELEASE_BASE}/download/${VERSION}/${asset}"
+  elif [ "$CHANNEL" = "prerelease" ]; then
+    url="${RELEASE_BASE}/download/${PRE_RELEASE_TAG}/${asset}"
+  else
+    url="${RELEASE_BASE}/latest/download/${asset}"
   fi
   if [ -n "$GH_PROXY" ] && [ -z "$BINARY_URL" ]; then
     url="${GH_PROXY%/}/${url}"
@@ -379,7 +452,7 @@ download_file() {
 }
 
 download_binary() {
-  local target="$1" url install_dir
+  local target="$1" url install_dir mark_file mark_tmp asset
   install_dir="$DEFAULT_INSTALL_DIR"
   [ -n "$install_dir" ] || die "无法确定安装目录"
 
@@ -405,7 +478,11 @@ download_binary() {
     info "下载地址: ${url}"
   else
     asset="apb-${target}"
-    info "检测到架构 ${target}，准备下载 ${asset}"
+    info "检测到架构 ${target}，下载通道: $(channel_name)"
+    if [ "$CHANNEL" = "prerelease" ] && [ "$VERSION" = "latest" ]; then
+      info "预发布 Release: ${PRE_RELEASE_TAG}（仓库中只保留一个）"
+    fi
+    info "准备下载 ${asset}"
     info "下载地址: ${url}"
   fi
 
@@ -427,6 +504,16 @@ download_binary() {
   fi
   TMP_FILE=""
   APB_BIN_PATH="$install_dir/apb"
+
+  # 记录安装目录里的二进制来自哪个通道，显式切换通道时不会被旧缓存误用。
+  mark_file="${install_dir%/}/.apb-channel"
+  mark_tmp="${install_dir%/}/.apb-channel.$$.$RANDOM"
+  if printf '%s\n' "$CHANNEL" > "$mark_tmp" 2>/dev/null && mv -f -- "$mark_tmp" "$mark_file" 2>/dev/null; then
+    :
+  else
+    rm -f -- "$mark_tmp" 2>/dev/null || true
+    warn "无法写入下载通道标记: $mark_file（下次显式切换通道时可能重新下载）"
+  fi
 }
 
 prompt_read() {
@@ -533,6 +620,42 @@ default_name() {
     ""|*[!A-Za-z0-9._-]*) host="node" ;;
   esac
   printf '%s@%s' "$user" "$host"
+}
+
+ask_channel() {
+  local ans
+  if [ "$CHANNEL_EXPLICIT" -eq 1 ] || [ -n "$BIN_OVERRIDE" ] || [ -n "$BINARY_URL" ]; then
+    return 0
+  fi
+  # 已显式指定具体 Release 版本时，通道不再影响下载地址。
+  if [ -n "$VERSION" ] && [ "$VERSION" != "latest" ]; then
+    return 0
+  fi
+  if [ "$ASSUME_YES" -eq 1 ] || [ "$INPUT_FROM_TTY" -eq 0 ]; then
+    CHANNEL="stable"
+    return 0
+  fi
+
+  while :; do
+    prompt_read ans "请输入下载通道（1=正式版 latest，2=预发布 pre-release，回车默认 1）: " 0 \
+      || die "没有可用的终端输入，无法询问下载通道"
+    ans="$(trim "$ans")"
+    case "${ans:-1}" in
+      1|stable|release|正式版|正式)
+        CHANNEL="stable"
+        return 0
+        ;;
+      2|pre|pre-release|prerelease|preview|beta|预发布|预发布版|预览|预览版)
+        CHANNEL="prerelease"
+        # 用户主动选择预发布时跳过本地 / 旧缓存二进制，确保从预发布 Release 下载。
+        CHANNEL_EXPLICIT=1
+        return 0
+        ;;
+      *)
+        warn "输入无效: ${ans}（请输入 1 或 2）"
+        ;;
+    esac
+  done
 }
 
 ask_server() {
@@ -737,6 +860,7 @@ main() {
 
   local target
   target="$(detect_target)"
+  ask_channel
   resolve_binary "$target"
   [ -n "$APB_BIN_PATH" ] || die "无法准备 apb 二进制"
   APB_BIN_VERSION="${APB_BIN_VERSION:-$("$APB_BIN_PATH" --version 2>/dev/null || printf 'apb')}"
