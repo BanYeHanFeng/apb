@@ -1,0 +1,235 @@
+name: 构建与发布
+
+# 触发方式：
+#   - push main / PR / 手动触发（不填 tag）：运行测试 + 静态构建；
+#   - push main 且提交标题严格匹配 `发布: vxxx`（例如 `发布: v0.1.1`）：
+#     构建并发布 latest 正式版，必要时自动创建 tag `v0.1.1`；
+#   - push main 且提交标题不是上述发布格式：
+#     构建并更新唯一的预发布 Release（固定 tag `pre-release`，不会创建新的 tag / Release）；
+#   - 推送 v* tag（例如 `git tag v0.1.1 && git push origin v0.1.1`）：
+#     构建并发布 latest 正式版；
+#   - 手动触发 workflow_dispatch 并填写 tag：发布对应标签；留空则只构建不发布。
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的标签（例如 v0.1.0）；留空则只构建不发布'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# PR 更新提交后自动取消旧任务；main / tag 的每次运行使用唯一 group，避免取消正在进行的发布
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  detect:
+    name: 解析发布版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_publish: ${{ steps.detect.outputs.should_publish }}
+      release_type: ${{ steps.detect.outputs.release_type }}
+      tag: ${{ steps.detect.outputs.tag }}
+      release_name: ${{ steps.detect.outputs.release_name }}
+      prerelease: ${{ steps.detect.outputs.prerelease }}
+    steps:
+      - name: 判断触发方式并生成发布信息
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag || '' }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message || '' }}
+          # 固定预发布 tag，runApb.sh 菜单中的“预发布版”也默认从该 tag 下载
+          PRERELEASE_TAG: pre-release
+        run: |
+          should_publish=false
+          release_type=""
+          tag=""
+          release_name=""
+          is_prerelease=false
+
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              tag="${INPUT_TAG#refs/tags/}"
+              if [ -n "$tag" ]; then
+                should_publish=true
+                release_type="stable"
+                release_name="$tag"
+                echo "将发布正式版：$tag"
+              else
+                echo "手动触发未填写 tag，跳过发布，只构建产物"
+              fi
+              ;;
+            push)
+              if [ "$REF_TYPE" = "tag" ]; then
+                tag="$REF_NAME"
+                should_publish=true
+                release_type="stable"
+                release_name="$tag"
+                echo "将发布正式版：$tag"
+              else
+                # 只取提交标题（commit message 第一行），并去掉首尾空白
+                title="${COMMIT_MESSAGE%%$'\n'*}"
+                title="${title#"${title%%[![:space:]]*}"}"
+                title="${title%"${title##*[![:space:]]}"}"
+                if [[ "$title" =~ ^发布:[[:space:]]+v([0-9][0-9A-Za-z._-]*)$ ]]; then
+                  tag="v${BASH_REMATCH[1]}"
+                  should_publish=true
+                  release_type="stable"
+                  release_name="$tag"
+                  echo "提交标题匹配发布格式，将发布正式版：$tag"
+                else
+                  # 非正式版推送：只更新同一个预发布 Release，不新建 tag / Release
+                  should_publish=true
+                  release_type="prerelease"
+                  tag="$PRERELEASE_TAG"
+                  release_name="预发布（滚动构建）"
+                  is_prerelease=true
+                  echo "提交标题未匹配发布格式，将更新预发布 Release：$tag"
+                  echo "预发布 Release 只保留这一个，本次会覆盖其中的静态二进制"
+                  echo "本次提交：${GITHUB_SHA:-unknown}"
+                  echo "提交标题：${title:-（空）}"
+                fi
+              fi
+              ;;
+            *)
+              echo "事件 $EVENT_NAME 不发布，只构建产物"
+              ;;
+          esac
+
+          {
+            echo "should_publish=$should_publish"
+            echo "release_type=$release_type"
+            echo "tag=$tag"
+            echo "release_name=$release_name"
+            echo "prerelease=$is_prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    name: 测试（本机）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+      - name: 配置 Rust 环境
+        run: |
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          rustup default stable
+          cargo --version
+      - name: 缓存 Cargo 依赖与构建产物
+        uses: Swatinem/rust-cache@v2
+      - name: 运行测试
+        run: cargo test --locked --all-targets
+      - name: 检查客户端一键脚本
+        run: bash -n runApb.sh
+
+  build:
+    name: 静态构建 ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [ detect, test ]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+      - name: 配置 Rust 环境并添加目标
+        run: |
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: 缓存 Cargo 依赖与编译产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 两个 musl target 的产物互不通用，按 target 隔离缓存
+          key: ${{ matrix.target }}
+      - name: 安装 Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          # cargo-zigbuild 0.23.4 上游 CI 已验证 Zig 0.16.0
+          version: '0.16.0'
+          # 矩阵任务使用不同的 Zig 缓存键，避免互相覆盖
+          cache-key: ${{ matrix.target }}
+      - name: 安装 cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          # 直接下载预编译二进制并校验 checksum，避免每次 cargo install 从源码编译
+          tool: cargo-zigbuild@0.23.4
+      - name: 构建静态二进制
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+      - name: 整理构建产物
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/apb" "dist/apb-${{ matrix.target }}"
+          chmod 0755 "dist/apb-${{ matrix.target }}"
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: apb-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 发布（正式版 / 预发布）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ detect, test, build ]
+    if: needs.detect.outputs.should_publish == 'true'
+    concurrency:
+      # 同一个 Release tag 的发布任务串行执行，避免快速连续推送时并发更新
+      group: apb-release-${{ needs.detect.outputs.tag }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: 下载全部静态产物
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 创建 / 更新 latest 正式版 Release
+        if: needs.detect.outputs.release_type == 'stable'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.detect.outputs.tag }}
+          name: ${{ needs.detect.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+      - name: 创建 / 更新唯一的预发布 Release
+        if: needs.detect.outputs.release_type == 'prerelease'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.detect.outputs.tag }}
+          name: ${{ needs.detect.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: true
+          make_latest: false
+          body: |
+            推送 `main` 后自动构建的滚动预发布版本，仓库中只保留这一个预发布 Release。
+            后续普通推送会覆盖这里两个静态二进制。
+
+            本次构建提交：`${{ github.sha }}`
+          files: dist/*
+          fail_on_unmatched_files: true

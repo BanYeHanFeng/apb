@@ -1,0 +1,16 @@
+# Rust toolchain build output
+/target/
+/dist/
+
+# Local build / test artifacts
+*.log
+*.pid
+*.tmp
+*.bak
+*.bak.*
+
+# Transfer temp files (created next to final target only on failure)
+.apb-*.tmp
+
+# Local-only notes containing real endpoints
+LOCAL.md
