@@ -32,7 +32,7 @@
   cargo zigbuild --release --locked --target aarch64-unknown-linux-musl
   ```
 - 回归测试：`tests/e2e.rs`（`cargo test` 会自动在 loopback 拉起 server + agent）。
-- 发布正式版：把提交标题写为 `V0.1.1正式版` 并推送 `main`（自动创建 `v0.1.1` tag），或直接推送 `v0.1.1` tag；`构建与发布` 工作流会发布 latest 正式版。
+- 发布正式版：把提交标题严格写为 `发布: v0.1.1` 并推送 `main`（自动创建 `v0.1.1` tag），或直接推送 `v0.1.1` tag；`构建与发布` 工作流会发布 latest 正式版。
 - 新能力优先只改 `src/` 与 `docs/`；保持“无 sshd、无配置文件”的约束。
 
 ## 常用命令

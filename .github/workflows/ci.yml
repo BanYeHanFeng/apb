@@ -2,8 +2,8 @@ name: 构建与发布
 
 # 触发方式：
 #   - push main / PR / 手动触发（不填 tag）：运行测试 + 静态构建；
-#   - push main 且提交标题匹配 `Vxxx正式版`（例如 `V0.1.1正式版`）：
-#     构建并发布 latest 正式版，必要时自动创建小写 tag `v0.1.1`；
+#   - push main 且提交标题严格匹配 `发布: vxxx`（例如 `发布: v0.1.1`）：
+#     构建并发布 latest 正式版，必要时自动创建 tag `v0.1.1`；
 #   - 推送 v* tag（例如 `git tag v0.1.1 && git push origin v0.1.1`）：
 #     构建并发布 latest 正式版；
 #   - 手动触发 workflow_dispatch 并填写 tag：发布对应标签。
@@ -59,11 +59,11 @@ jobs:
                 title="${COMMIT_MESSAGE%%$'\n'*}"
                 title="${title#"${title%%[![:space:]]*}"}"
                 title="${title%"${title##*[![:space:]]}"}"
-                if [[ "$title" =~ ^[Vv][[:space:]]*([0-9][0-9A-Za-z._-]*)[[:space:]]*正式版([[:space:]]*\(#[0-9]+\))?$ ]]; then
+                if [[ "$title" =~ ^发布:[[:space:]]+v([0-9][0-9A-Za-z._-]*)$ ]]; then
                   tag="v${BASH_REMATCH[1]}"
                   should_release=true
                 else
-                  echo "提交标题不匹配 Vxxx正式版，跳过发布：${title}"
+                  echo "提交标题不匹配 发布: vxxx，跳过发布：${title}"
                 fi
               fi
               ;;
