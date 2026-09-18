@@ -1,0 +1,40 @@
+name: apb 临时节点
+
+# 在 GitHub 托管 runner 上运行 apb agent，并通过出站连接接入你的 `apb serve`。
+# 服务端地址和预共享密钥来自仓库 secrets，因此公开仓库也能使用（Actions 会隐藏日志中的 secret）。
+# runner 上除了 checkout 和 Cargo 构建目录外不落任何配置；runner 本身用完即焚。
+on:
+  workflow_dispatch:
+    inputs:
+      ttl_minutes:
+        description: 连接保持时长（分钟，最大 360）
+        required: false
+        default: "120"
+      name:
+        description: 可选：覆盖默认节点名
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    name: 接入临时 agent
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.ttl_minutes || '120') }}
+    env:
+      APB_SERVER: ${{ secrets.APB_SERVER }}
+      APB_KEY: ${{ secrets.APB_KEY }}
+      APB_NAME: ${{ github.event.inputs.name != '' && github.event.inputs.name || format('{0}-gh-{1}', github.repository_owner, github.run_id) }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+      - name: 配置 Rust 环境
+        run: |
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          rustup default stable
+      - name: 构建二进制
+        run: cargo build --release --locked
+      - name: 启动 agent
+        run: ./target/release/apb agent

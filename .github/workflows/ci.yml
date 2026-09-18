@@ -1,0 +1,154 @@
+name: 构建与发布
+
+# 触发方式：
+#   - push main / PR / 手动触发（不填 tag）：运行测试 + 静态构建；
+#   - push main 且提交标题匹配 `Vxxx正式版`（例如 `V0.1.1正式版`）：
+#     构建并发布 latest 正式版，必要时自动创建小写 tag `v0.1.1`；
+#   - 推送 v* tag（例如 `git tag v0.1.1 && git push origin v0.1.1`）：
+#     构建并发布 latest 正式版；
+#   - 手动触发 workflow_dispatch 并填写 tag：发布对应标签。
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的标签（例如 v0.1.0）；留空则只构建不发布'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: 解析发布版本
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.detect.outputs.should_release }}
+      tag: ${{ steps.detect.outputs.tag }}
+    steps:
+      - name: 判断触发方式并生成 tag
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag || '' }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message || '' }}
+        run: |
+          should_release=false
+          tag=""
+
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              tag="${INPUT_TAG#refs/tags/}"
+              if [ -n "$tag" ]; then
+                should_release=true
+              fi
+              ;;
+            push)
+              if [ "$REF_TYPE" = "tag" ]; then
+                tag="$REF_NAME"
+                should_release=true
+              else
+                # 只取提交标题（commit message 第一行），并去掉首尾空白
+                title="${COMMIT_MESSAGE%%$'\n'*}"
+                title="${title#"${title%%[![:space:]]*}"}"
+                title="${title%"${title##*[![:space:]]}"}"
+                if [[ "$title" =~ ^[Vv][[:space:]]*([0-9][0-9A-Za-z._-]*)[[:space:]]*正式版([[:space:]]*\(#[0-9]+\))?$ ]]; then
+                  tag="v${BASH_REMATCH[1]}"
+                  should_release=true
+                else
+                  echo "提交标题不匹配 Vxxx正式版，跳过发布：${title}"
+                fi
+              fi
+              ;;
+          esac
+
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$should_release" = "true" ]; then
+            echo "将发布正式版：$tag"
+          fi
+
+  test:
+    name: 测试（本机）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+      - name: 配置 Rust 环境
+        run: |
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          rustup default stable
+          cargo --version
+      - name: 运行测试
+        run: cargo test --locked --all-targets
+
+  build:
+    name: 静态构建 ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    needs: [ detect, test ]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+      - name: 配置 Rust 环境并添加目标
+        run: |
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: 安装 Zig（纯 Python wheel，不改系统包）
+        run: python3 -m pip install --user --break-system-packages ziglang
+      - name: 安装 cargo-zigbuild
+        run: |
+          cargo install cargo-zigbuild --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: 构建静态二进制
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+      - name: 整理构建产物
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/apb" "dist/apb-${{ matrix.target }}"
+          chmod 0755 "dist/apb-${{ matrix.target }}"
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: apb-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 发布正式版
+    runs-on: ubuntu-latest
+    needs: [ detect, test, build ]
+    if: needs.detect.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: 下载全部静态产物
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 创建 / 更新正式版 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.detect.outputs.tag }}
+          name: ${{ needs.detect.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
