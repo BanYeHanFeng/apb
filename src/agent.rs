@@ -86,22 +86,64 @@ fn sanitize_name(name: &str) -> String {
     s
 }
 
+/// Annotate a connection stage with its name and elapsed time so the one-line
+/// error the agent prints is enough to tell *where* a failure happened:
+///
+/// * `connect`    — DNS / SYN / local socket setup never completed,
+/// * `handshake`  — TCP is up but the Noise PSK handshake did not finish
+///                  (usually: the key differs from the server's, or something
+///                  on the path is cutting the stream),
+/// * `hello`      — the agent identity frame could not be sent,
+/// * `hello_reply`— the server never answered with `hello_ok`.
+///
+/// `os error 11` (EAGAIN / "Resource temporarily unavailable") reported here is
+/// a *timeout on this socket*, not an apb key or protocol error.
+fn stage<T>(label: &str, start: Instant, r: io::Result<T>) -> io::Result<T> {
+    r.map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "stage={label} after {}ms: {e}",
+                start.elapsed().as_millis()
+            ),
+        )
+    })
+}
+
 pub fn run_once(server: &str, key: &[u8; 32], name: &str) -> io::Result<()> {
-    let addr = crate::util::resolve_addr(server)?;
-    let stream = TcpStream::connect(addr)?;
-    let conn = Arc::new(Conn::from_stream(stream, key, true)?);
-    conn.send_frame(&Frame::Hello {
-        role: ROLE_AGENT,
-        name: name.to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        pid: std::process::id(),
-    })?;
-    match Frame::decode(&conn.recv()?)
+    let started = Instant::now();
+    let stage_at = Instant::now();
+    let addr = stage("resolve", stage_at, crate::util::resolve_addr(server))?;
+    let stage_at = Instant::now();
+    let stream = stage("connect", stage_at, TcpStream::connect(addr))?;
+    let stage_at = Instant::now();
+    let conn = Arc::new(stage(
+        "handshake",
+        stage_at,
+        Conn::from_stream(stream, key, true),
+    )?);
+    let stage_at = Instant::now();
+    stage(
+        "hello",
+        stage_at,
+        conn.send_frame(&Frame::Hello {
+            role: ROLE_AGENT,
+            name: name.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            pid: std::process::id(),
+        }),
+    )?;
+    let stage_at = Instant::now();
+    let reply = stage("hello_reply", stage_at, conn.recv())?;
+    match Frame::decode(&reply)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
     {
-        Frame::HelloOk { .. } => eprintln!("apb agent `{name}` connected"),
+        Frame::HelloOk { .. } => eprintln!(
+            "apb agent `{name}` connected ({}ms)",
+            started.elapsed().as_millis()
+        ),
         Frame::Error { code, message } => {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
