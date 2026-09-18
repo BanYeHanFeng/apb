@@ -14,9 +14,18 @@ name = "apb"
 path = "src/main.rs"
 
 [dependencies]
-snow = "0.9"
-sha2 = "0.10"
-getrandom = "0.2"
+# 线协议固定为 Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s，因此只启用用到的算法后端。
+# 注意别打开 snow 的 `std` 特性：它会顺带启用并未使用的 ring 后端（需要 cc 交叉编译），
+# 对静态 musl 产物没有收益。
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "use-chacha20poly1305",
+    "use-curve25519",
+    "use-blake2",
+    "use-getrandom",
+] }
+sha2 = "0.11"
+getrandom = "0.4"
 libc = "0.2"
 
 [profile.release]

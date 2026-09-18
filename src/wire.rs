@@ -67,6 +67,7 @@ fn handshake(
     let transport = if initiator {
         let mut hs = snow::Builder::new(params)
             .psk(0, psk)
+            .map_err(|e| ioerr(format!("noise psk: {e}")))?
             .build_initiator()
             .map_err(|e| ioerr(format!("noise initiator: {e}")))?;
         stream.write_all(MAGIC)?;
@@ -91,6 +92,7 @@ fn handshake(
         }
         let mut hs = snow::Builder::new(params)
             .psk(0, psk)
+            .map_err(|e| ioerr(format!("noise psk: {e}")))?
             .build_responder()
             .map_err(|e| ioerr(format!("noise responder: {e}")))?;
         let first = read_handshake_msg(stream)?;

@@ -160,12 +160,12 @@ jobs:
       contents: write
     steps:
       - name: 下载全部静态产物
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - name: 创建 / 更新正式版 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.detect.outputs.tag }}
           name: ${{ needs.detect.outputs.tag }}

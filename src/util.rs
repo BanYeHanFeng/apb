@@ -71,7 +71,7 @@ fn hex_val(c: u8) -> io::Result<u8> {
 
 pub fn gen_key() -> io::Result<[u8; 32]> {
     let mut key = [0u8; 32];
-    getrandom::getrandom(&mut key).map_err(|e| io_err(format!("getrandom failed: {e}")))?;
+    getrandom::fill(&mut key).map_err(|e| io_err(format!("getrandom failed: {e}")))?;
     Ok(key)
 }
 
