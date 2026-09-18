@@ -38,6 +38,9 @@
 ## 常用命令
 
 ```bash
+# 客户端一键脚本（自动下载静态 apb，交互询问服务端 / 密钥 / 节点名）
+bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
+
 apb keygen
 apb serve --bind 0.0.0.0:30020 --key "$APB_KEY"
 APB_SERVER=IP:30020 APB_KEY="$APB_KEY" APB_NAME=node-a apb agent

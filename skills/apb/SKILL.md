@@ -44,6 +44,9 @@ export APB_KEY="$(./apb keygen)"
 # —— 手机 / runner 客户端 ——
 APB_SERVER='IP:30020' APB_KEY="$APB_KEY" APB_NAME='phone-a' ./apb agent
 
+# —— 节点一键接入（脚本自动下载二进制并交互询问参数）——
+# bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
+
 # —— 本机控制 ——
 ./apb status --server IP:30020 --key "$APB_KEY" --json
 ./apb exec   --server IP:30020 --key "$APB_KEY" --name phone-a --json -- 'uname -a'

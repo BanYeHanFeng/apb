@@ -88,6 +88,8 @@ jobs:
           cargo --version
       - name: 运行测试
         run: cargo test --locked --all-targets
+      - name: 检查客户端一键脚本
+        run: bash -n runApb.sh
 
   build:
     name: 静态构建 ${{ matrix.target }}

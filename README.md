@@ -7,6 +7,17 @@
   <b>- 答：</b>把本项目链接粘贴给 AI <br>
 </p>
 
+## 一键客户端
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
+```
+
+脚本会自动检测 CPU 架构、下载对应的静态 `apb`，然后依次询问：
+- 服务端地址（`IP:端口`，缺省端口 `30020`）
+- `APB_KEY`（64 位 hex，输入不回显）
+- 节点名（回车使用 `USER@HOSTNAME`）
+- 是否后台运行（回车默认 `Y`）
+
 ## 文档
 | 文档 | 内容 |
 |---|---|
