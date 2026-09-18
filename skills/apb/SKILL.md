@@ -70,6 +70,11 @@ APB_SERVER='IP:30020' APB_KEY="$APB_KEY" APB_NAME='phone-a' ./apb agent
 7. push/pull 的远端路径不做本机 shell 展开；`~` 加引号交给 agent 解析。
 8. `doctor` 只检查到服务端的 Noise 握手，不代表 agent 在线。
 9. 不打印 `APB_KEY`；不把 `APB_KEY` 写进文件、命令参数或 workflow inputs。
+10. agent 连不上时看它打印的 `stage=`：`resolve` / `connect` / `handshake` / `hello` / `hello_reply`，后接 `after Nms`。
+    `os error 11`（EAGAIN）是本机 socket 失败或超时，不是密钥错误（密钥不符表现为
+    `stage=handshake ... failed to fill whole buffer`，同时服务端日志出现 `noise read: decrypt error`）。
+    重试间隔约 1 秒＝每次立刻失败（本机 / 链路拒绝），十几秒＝在等超时；手机端优先排查
+    VPN / 代理（sing-box、Clash、v2rayNG）、省电与后台数据限制、私有 DNS，并换网络对照。
 
 ## 输出契约
 
