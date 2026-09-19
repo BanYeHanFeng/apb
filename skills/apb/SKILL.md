@@ -53,15 +53,18 @@ command -v apb || BIN=./target/release/apb
 cargo build --release --locked
 ./target/release/apb --version
 
-# 目标节点一键下载并启动 agent（自动识别 x86_64 / aarch64）
+# 目标节点一键管理（自动识别 x86_64 / aarch64；无参数进入 1/2/3 数字菜单）
 bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
 # 不支持进程替换的 shell：curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh | bash
+# 菜单：1 启动 / 2 停止 / 3 重启 / 4 更新 / 5 状态 / 6 修改配置 / 0 退出
+# 也可直接执行：bash runApb.sh start|stop|restart|update|status|config
 
 # 非交互 / 只安装 / 前台 / 预发布通道
 # APB_SERVER='IP:30020' APB_KEY="$APB_KEY" APB_NAME=node-a APB_CHANNEL=prerelease \
 #   bash runApb.sh --yes --background
 # bash runApb.sh --install-only
 # bash runApb.sh --foreground
+# 注意：菜单/管理命令会把非密钥配置保存到 ~/.config/apb/agent.conf，APB_KEY 不落盘。
 ```
 
 静态 musl 构建、CI 与发布说明见 `docs/构建与测试.md`。
@@ -83,9 +86,10 @@ journalctl -u apb-serve -n 50 --no-pager
 ## 三、接入节点
 
 ```bash
-# A. Termux / Android：无 root、无 sshd，一条命令交互下载并启动
+# A. Termux / Android：无 root、无 sshd，一条命令打开管理菜单
 bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
-# 交互询问：通道（1 正式版 / 2 预发布）、APB_SERVER、APB_KEY、节点名、是否后台
+# 首次选 1 启动：询问通道（1 正式版 / 2 预发布）、APB_SERVER、APB_KEY、节点名、运行方式
+# 之后用 1 启动 / 2 停止 / 3 重启 / 4 更新 / 5 状态 / 6 配置 / 0 退出
 
 # B. 已有 apb 的 Linux / runner：指定 APB_NAME 后启动
 APB_SERVER='IP:30020' APB_KEY="$APB_KEY" APB_NAME='node-a' apb agent
