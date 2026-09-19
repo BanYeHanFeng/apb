@@ -3,27 +3,33 @@
 use apb::agent::{self, AgentOptions};
 use apb::ctrl::{self, ExecOptions, PullOptions, PushOptions, StatusOptions};
 use apb::util::{gen_key, hex, json_escape, parse_key};
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::process::exit;
+use std::sync::OnceLock;
 
-const DEFAULT_SERVER: &str = "127.0.0.1:30020";
-const DEFAULT_BIND: &str = "0.0.0.0:30020";
+static FILE_CONFIG: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 fn usage() {
     eprintln!(
-        "apb {} - Agent Proxy Bridge (no sshd, no config files)\n\
+        "apb {} - Agent Proxy Bridge (no sshd)\n\
 \n\
 Usage:\n\
   apb keygen [--json]\n\
   apb serve  [--bind IP:PORT] [--key KEY]\n\
-  apb agent  [--server IP:PORT] [--key KEY] [--name NAME]\n\
-  apb status [--server IP:PORT] [--key KEY] [--json]\n\
+  apb agent  [--server IP:PORT] [--key KEY] [--name NAME] [--config FILE]\n\
+  apb status [--server IP:PORT] [--key KEY] [--config FILE] [--json]\n\
   apb exec   [options] -- COMMAND...\n\
   apb push   [options] LOCAL [REMOTE]\n\
   apb pull   [options] REMOTE [LOCAL]\n\
-  apb doctor [--server IP:PORT] [--key KEY] [--json]\n\
+  apb doctor [--server IP:PORT] [--key KEY] [--config FILE] [--json]\n\
 \n\
-Config is read from APB_SERVER / APB_BIND / APB_KEY / APB_NAME, or from the\n\
-flags above.  No configuration file is created or read.\n\
+Server address and --bind require an explicit port; no default port is applied.\n\
+Flags override environment variables (APB_SERVER / APB_BIND / APB_KEY / APB_NAME),\n\
+and environment variables override the config file.  The config file is selected\n\
+by --config, then APB_CONFIG, APB_CONFIG_DIR/agent.conf, XDG_CONFIG_HOME/apb/agent.conf\n\
+or ~/.config/apb/agent.conf.  --bind may also come from APB_BIND or config.\n\
 \n\
 exec options:\n\
   --server A --key K --name AGENT --json --b64 --raw\n\
@@ -42,6 +48,15 @@ fn main() {
     }
     let cmd = args[0].as_str();
     let rest = &args[1..];
+    if !matches!(
+        cmd,
+        "keygen" | "version" | "--version" | "-V" | "help" | "--help" | "-h"
+    ) {
+        if let Err(err) = load_file_config(rest) {
+            eprintln!("apb: {err}");
+            exit(2);
+        }
+    }
     match cmd {
         "keygen" => cmd_keygen(rest),
         "serve" | "server" => cmd_serve(rest),
@@ -59,6 +74,10 @@ fn main() {
             exit(64);
         }
     }
+}
+
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }
 
 fn env_or(args: &[String], name: &str) -> Option<String> {
@@ -85,7 +104,94 @@ fn env_or(args: &[String], name: &str) -> Option<String> {
 }
 
 fn env_str(args: &[String], flag: &str, var: &str) -> Option<String> {
-    env_or(args, flag).or_else(|| std::env::var(var).ok().filter(|s| !s.trim().is_empty()))
+    env_or(args, flag).or_else(|| env_var(var)).or_else(|| {
+        FILE_CONFIG
+            .get()
+            .and_then(|m| m.get(var))
+            .cloned()
+            .filter(|s| !s.trim().is_empty())
+    })
+}
+
+fn config_path(args: &[String]) -> (Option<PathBuf>, bool) {
+    if let Some(path) = env_or(args, "--config") {
+        return (Some(PathBuf::from(path)), true);
+    }
+    if let Some(path) = env_var("APB_CONFIG") {
+        return (Some(PathBuf::from(path)), true);
+    }
+    if let Some(dir) = env_var("APB_CONFIG_DIR") {
+        return (Some(PathBuf::from(dir).join("agent.conf")), false);
+    }
+    let config_home = env_var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env_var("HOME").map(|home| PathBuf::from(home).join(".config")));
+    match config_home {
+        Some(base) => (Some(base.join("apb").join("agent.conf")), false),
+        None => (None, false),
+    }
+}
+
+/// Read simple `KEY=VALUE` lines from the agent config file.  Missing default
+/// files are ignored; an explicitly requested file must exist and be readable.
+/// Values are used only as fallbacks for CLI flags / environment variables.
+fn load_file_config(args: &[String]) -> Result<(), String> {
+    let (path, required) = config_path(args);
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if required => {
+            return Err(format!("cannot read config file {}: {err}", path.display()));
+        }
+        Err(_) => return Ok(()),
+    };
+
+    let mut values = HashMap::new();
+    for (index, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            if required {
+                return Err(format!(
+                    "invalid config line {} in {}: missing `=`",
+                    index + 1,
+                    path.display()
+                ));
+            }
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.starts_with("APB_") {
+            continue;
+        }
+        values.insert(key.to_string(), value.trim().to_string());
+    }
+
+    // Only the first loaded file is used; load_file_config runs once per process.
+    let _ = FILE_CONFIG.set(values);
+    Ok(())
+}
+
+fn required_server(args: &[String]) -> String {
+    env_str(args, "--server", "APB_SERVER").unwrap_or_else(|| {
+        eprintln!(
+            "apb: missing server: pass --server, set APB_SERVER, or add APB_SERVER to the config file"
+        );
+        exit(2);
+    })
+}
+
+fn required_bind(args: &[String]) -> String {
+    env_str(args, "--bind", "APB_BIND").unwrap_or_else(|| {
+        eprintln!(
+            "apb: missing bind address: pass --bind IP:PORT, set APB_BIND, or add APB_BIND to the config file"
+        );
+        exit(2);
+    })
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {
@@ -102,7 +208,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 
 fn required_key(args: &[String]) -> [u8; 32] {
     let raw = env_str(args, "--key", "APB_KEY").unwrap_or_else(|| {
-        eprintln!("apb: missing key: set APB_KEY (or pass --key)");
+        eprintln!("apb: missing key: pass --key, set APB_KEY, or add APB_KEY to the config file");
         exit(2);
     });
     parse_key(&raw).unwrap_or_else(|e| {
@@ -130,7 +236,14 @@ fn positional(args: &[String]) -> Vec<String> {
         if a.starts_with("--") {
             let takes_value = matches!(
                 a.as_str(),
-                "--server" | "--key" | "--name" | "--timeout" | "--cwd" | "--max-output" | "--bind"
+                "--server"
+                    | "--key"
+                    | "--name"
+                    | "--timeout"
+                    | "--cwd"
+                    | "--max-output"
+                    | "--bind"
+                    | "--config"
             );
             i += if takes_value { 2 } else { 1 };
             continue;
@@ -166,7 +279,7 @@ fn cmd_keygen(args: &[String]) -> ! {
 
 fn cmd_serve(args: &[String]) -> ! {
     let key = required_key(args);
-    let bind = env_str(args, "--bind", "APB_BIND").unwrap_or_else(|| DEFAULT_BIND.into());
+    let bind = required_bind(args);
     if let Err(e) = apb::server::serve(&bind, key) {
         eprintln!("apb: serve: {e}");
         exit(1);
@@ -175,10 +288,7 @@ fn cmd_serve(args: &[String]) -> ! {
 }
 
 fn cmd_agent(args: &[String]) -> ! {
-    let server = env_str(args, "--server", "APB_SERVER").unwrap_or_else(|| {
-        eprintln!("apb: missing server: set APB_SERVER (or pass --server)");
-        exit(2);
-    });
+    let server = required_server(args);
     let key = required_key(args);
     let name = env_str(args, "--name", "APB_NAME").unwrap_or_else(agent::default_name);
     if let Err(e) = agent::run(AgentOptions { server, key, name }) {
@@ -189,21 +299,21 @@ fn cmd_agent(args: &[String]) -> ! {
 }
 
 fn cmd_status(args: &[String]) -> ! {
-    let server = env_str(args, "--server", "APB_SERVER").unwrap_or_else(|| DEFAULT_SERVER.into());
+    let server = required_server(args);
     let key = required_key(args);
     let json = has_flag(args, "--json");
     exit(ctrl::status(StatusOptions { server, key, json }))
 }
 
 fn cmd_doctor(args: &[String]) -> ! {
-    let server = env_str(args, "--server", "APB_SERVER").unwrap_or_else(|| DEFAULT_SERVER.into());
+    let server = required_server(args);
     let key = required_key(args);
     let json = has_flag(args, "--json");
     exit(ctrl::doctor(&server, &key, json))
 }
 
 fn cmd_exec(args: &[String]) -> ! {
-    let server = env_str(args, "--server", "APB_SERVER").unwrap_or_else(|| DEFAULT_SERVER.into());
+    let server = required_server(args);
     let key = required_key(args);
     let target = env_str(args, "--name", "APB_NAME").unwrap_or_default();
     let json = has_flag(args, "--json");
@@ -233,7 +343,7 @@ fn cmd_exec(args: &[String]) -> ! {
 }
 
 fn cmd_push(args: &[String]) -> ! {
-    let server = env_str(args, "--server", "APB_SERVER").unwrap_or_else(|| DEFAULT_SERVER.into());
+    let server = required_server(args);
     let key = required_key(args);
     let target = env_str(args, "--name", "APB_NAME").unwrap_or_default();
     let json = has_flag(args, "--json");
@@ -258,7 +368,7 @@ fn cmd_push(args: &[String]) -> ! {
 }
 
 fn cmd_pull(args: &[String]) -> ! {
-    let server = env_str(args, "--server", "APB_SERVER").unwrap_or_else(|| DEFAULT_SERVER.into());
+    let server = required_server(args);
     let key = required_key(args);
     let target = env_str(args, "--name", "APB_NAME").unwrap_or_default();
     let json = has_flag(args, "--json");

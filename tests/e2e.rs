@@ -169,3 +169,85 @@ fn loopback_exec_and_files() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn config_file_supplies_server_key_and_name() {
+    let port = free_port();
+    let server = format!("127.0.0.1:{port}");
+    let agent = format!("apb-config-{}", std::process::id());
+
+    let server_child = Command::new(bin())
+        .args(["serve", "--bind", &server, "--key", KEY])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _server_guard = Kill(server_child);
+    wait_port(port);
+
+    let root = std::env::temp_dir().join(format!("apb-e2e-config-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let config = root.join("agent.conf");
+    fs::write(
+        &config,
+        format!("# apb test config\nAPB_SERVER={server}\nAPB_KEY={KEY}\nAPB_NAME={agent}\n"),
+    )
+    .unwrap();
+
+    let agent_child = Command::new(bin())
+        .args(["agent", "--config", config.to_str().unwrap()])
+        .env_remove("APB_SERVER")
+        .env_remove("APB_KEY")
+        .env_remove("APB_NAME")
+        .env_remove("APB_CONFIG")
+        .env_remove("APB_CONFIG_DIR")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _agent_guard = Kill(agent_child);
+    wait_status(&server, &agent);
+
+    // Controller uses only the config file: both server and key come from it.
+    let out = Command::new(bin())
+        .args(["status", "--config", config.to_str().unwrap(), "--json"])
+        .env_remove("APB_SERVER")
+        .env_remove("APB_KEY")
+        .env_remove("APB_NAME")
+        .env_remove("APB_CONFIG")
+        .env_remove("APB_CONFIG_DIR")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "status={:?} text={text} err={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains(&agent), "{text}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn missing_server_and_bind_have_no_default_port() {
+    let out = Command::new(bin())
+        .args(["status"])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("missing server"), "{stderr}");
+
+    let out = Command::new(bin())
+        .args(["serve", "--key", KEY])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("missing bind"), "{stderr}");
+}

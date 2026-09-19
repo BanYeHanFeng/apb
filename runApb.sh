@@ -26,14 +26,13 @@
 #   APB_TARGET                        覆盖自动检测的 Rust target / 资产后缀
 #
 # 说明：
-#   脚本会把服务端地址、节点名、下载通道、运行方式等非密钥信息保存到 APB_CONFIG
-#   （权限 600），方便下次启动 / 重启；APB_KEY 不写入配置文件，只在启动/重启时
-#   通过 /dev/tty 无回显读取后以环境变量传给 agent。
+#   脚本会把服务端地址、密钥、节点名、下载通道、运行方式等配置保存到 APB_CONFIG
+#   （权限 600）；启动/重启时不再通过环境变量传参，而是让 agent 通过
+#   `--config <文件>` 读取。apb 二进制本身仍保留读取 APB_* 环境变量。
 #
 set -Eeuo pipefail
 
 DEFAULT_REPO="${APB_REPO:-BanYeHanFeng/apb}"
-DEFAULT_PORT=30020
 DEFAULT_INSTALL_DIR="${APB_INSTALL_DIR:-${HOME:-.}/.local/bin}"
 DEFAULT_RELEASE_BASE="${APB_RELEASE_BASE:-https://github.com/${DEFAULT_REPO}/releases}"
 BACKGROUND_MODE="${APB_BACKGROUND:-ask}"   # ask / 1 / 0
@@ -382,7 +381,7 @@ prompt_read() {
 }
 
 normalize_server() {
-  local raw host port ipv6=0 p
+  local raw host port p
   raw="$(trim "$1")"
   [ -n "$raw" ] || return 1
   [[ "$raw" != *[[:space:]]* ]] || return 1
@@ -392,15 +391,10 @@ normalize_server() {
 
   if [[ "$raw" =~ ^\[([0-9A-Fa-f:.]+)\]:([0-9]{1,5})$ ]]; then
     host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
-  elif [[ "$raw" =~ ^\[([0-9A-Fa-f:.]+)\]$ ]]; then
-    host="${BASH_REMATCH[1]}"; port="$DEFAULT_PORT"
   elif [[ "$raw" =~ ^([A-Za-z0-9._-]+):([0-9]{1,5})$ ]]; then
     host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
-  elif [[ "$raw" =~ ^[A-Za-z0-9._-]+$ ]]; then
-    host="$raw"; port="$DEFAULT_PORT"
-  elif [[ "$raw" == *:* ]] && [[ "$raw" =~ ^[0-9A-Fa-f:.]+$ ]]; then
-    host="$raw"; port="$DEFAULT_PORT"; ipv6=1
   else
+    # 不固定默认端口：server 地址必须显式带端口。
     return 1
   fi
 
@@ -408,7 +402,7 @@ normalize_server() {
   if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
     return 1
   fi
-  if [ "$ipv6" -eq 1 ] || [[ "$host" == *:* ]]; then
+  if [[ "$host" == *:* ]]; then
     SERVER_NORM="[$host]:$p"
   else
     SERVER_NORM="${host}:${p}"
@@ -493,15 +487,15 @@ ask_server() {
         return 0
       fi
       if [ "$INPUT_FROM_TTY" -eq 0 ]; then
-        die "APB_SERVER 格式非法: $SERVER"
+        die "APB_SERVER 格式非法（必须包含端口）: $SERVER"
       fi
-      warn "已有 APB_SERVER 格式非法: $SERVER"
+      warn "已有 APB_SERVER 格式非法（必须包含端口）: $SERVER"
       SERVER=""
     fi
     if [ "$INPUT_FROM_TTY" -eq 0 ]; then
       die "没有可用的终端输入，无法询问 APB_SERVER"
     fi
-    prompt_read ans "请输入服务端地址（IP:端口，可省略端口，默认 ${DEFAULT_PORT}）: " 0 \
+    prompt_read ans "请输入服务端地址（IP:端口，必须包含端口，例如 1.2.3.4:30021）: " 0 \
       || die "没有可用的终端输入，无法询问 APB_SERVER"
     ans="$(trim "$ans")"
     if [ -z "$ans" ]; then
@@ -509,7 +503,7 @@ ask_server() {
       continue
     fi
     if ! normalize_server "$ans"; then
-      warn "服务端地址格式不正确: $ans"
+      warn "服务端地址格式不正确（必须包含端口）: $ans"
       continue
     fi
     SERVER="$SERVER_NORM"
@@ -645,12 +639,19 @@ load_config() {
     case "$line" in
       ''|'#'*) continue ;;
     esac
-    key="${line%%=*}"
-    [ "$key" != "$line" ] || continue
+    case "$line" in
+      *=*) ;;
+      *) continue ;;
+    esac
+    key="$(trim "${line%%=*}")"
+    [ -n "$key" ] || continue
     value="$(trim "${line#*=}")"
     case "$key" in
       APB_SERVER)
         if [ -z "$SERVER" ]; then SERVER="$value"; found=1; fi
+        ;;
+      APB_KEY)
+        if [ -z "$KEY" ] && [ -n "$value" ]; then KEY="$value"; found=1; fi
         ;;
       APB_NAME)
         if [ -z "$NAME" ]; then NAME="$value"; found=1; fi
@@ -688,7 +689,7 @@ load_config() {
   return 0
 }
 
-# 写入非密钥配置；APB_KEY 永远不落盘。
+# 写入完整配置；APB_KEY 与其它字段一样保存在 600 权限的配置文件里。
 save_config() {
   local tmp
   ensure_config_dir || return 1
@@ -696,9 +697,12 @@ save_config() {
   if (
     umask 077
     {
-      printf '%s\n' '# apb 客户端管理配置（不包含 APB_KEY）'
+      printf '%s\n' '# apb 客户端管理配置（包含 APB_KEY，请保持 600 权限）'
       if [ -n "$SERVER" ]; then
         printf 'APB_SERVER=%s\n' "$SERVER"
+      fi
+      if [ -n "$KEY" ]; then
+        printf 'APB_KEY=%s\n' "$KEY"
       fi
       if [ -n "$NAME" ]; then
         printf 'APB_NAME=%s\n' "$NAME"
@@ -727,7 +731,7 @@ save_config() {
 persist_config() {
   [ "$PERSIST_CONFIG" -eq 1 ] || return 0
   if save_config; then
-    info "配置已保存: $CONFIG_FILE（APB_KEY 未写入）"
+    info "配置已保存: $CONFIG_FILE（密钥已写入，权限 600）"
     CONFIG_LOADED=1
   else
     warn "配置保存失败，将继续执行"
@@ -744,9 +748,9 @@ edit_server() {
   require_tty
   while :; do
     if [ -n "$default" ]; then
-      prompt_read ans "服务端地址（回车保持 ${default}）: " 0 || die "没有可用的终端输入"
+      prompt_read ans "服务端地址（IP:端口，回车保持 ${default}）: " 0 || die "没有可用的终端输入"
     else
-      prompt_read ans "服务端地址（IP:端口，可省略端口，默认 ${DEFAULT_PORT}）: " 0 || die "没有可用的终端输入"
+      prompt_read ans "服务端地址（IP:端口，必须包含端口）: " 0 || die "没有可用的终端输入"
     fi
     ans="$(trim "$ans")"
     if [ -z "$ans" ]; then
@@ -760,7 +764,7 @@ edit_server() {
       SERVER="$SERVER_NORM"
       return 0
     fi
-    warn "服务端地址格式不正确: $ans"
+    warn "服务端地址格式不正确（必须包含端口）: $ans"
     default=""
   done
 }
@@ -786,8 +790,12 @@ edit_name() {
 edit_key() {
   local ans="" prompt=""
   require_tty
+  if [ -n "$KEY" ] && ! validate_key "$KEY"; then
+    warn "配置中的 APB_KEY 格式不正确，请重新输入"
+    KEY=""
+  fi
   if [ -n "$KEY" ]; then
-    prompt="APB_KEY（回车保持本次会话已输入的密钥，输入新值则更新；不落盘）: "
+    prompt="APB_KEY（回车保持已保存的密钥，输入新值则更新；不显示）: "
   else
     prompt="APB_KEY（64 位 hex，输入不回显；可留空稍后启动时输入）: "
   fi
@@ -842,7 +850,7 @@ edit_background() {
 action_config() {
   require_tty
   printf '\n'
-  info "修改连接配置（APB_KEY 不落盘，可只改其他字段）"
+  info "修改连接配置（密钥会保存到配置文件，权限 600）"
   edit_server
   edit_name
   edit_key
@@ -851,7 +859,7 @@ action_config() {
   PERSIST_CONFIG=1
   save_config || die "配置保存失败: $CONFIG_FILE"
   ok "配置已保存: $CONFIG_FILE"
-  printf '    APB_KEY 将在启动/重启时读取，不会写入配置文件。\n'
+  printf '    APB_KEY 已写入配置文件，不会通过环境变量传给 agent。\n'
   return 0
 }
 
@@ -886,6 +894,23 @@ _pid_env_value() {
   return 1
 }
 
+# 读取 /proc/<pid>/cmdline 中某个选项的值（支持 `--opt value` 与 `--opt=value`）。
+_pid_arg_value() {
+  local pid="$1" want="$2" prev="" arg
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  while IFS= read -r arg; do
+    if [ "$prev" = "$want" ]; then
+      printf '%s\n' "$arg"
+      return 0
+    fi
+    case "$arg" in
+      "$want"=*) printf '%s\n' "${arg#*=}"; return 0 ;;
+    esac
+    prev="$arg"
+  done < <(tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null || true)
+  return 1
+}
+
 _exe_looks_like_apb() {
   local exe="$1"
   case "$exe" in
@@ -902,13 +927,19 @@ _exe_looks_like_apb() {
 
 # 判定 PID 文件里的进程是否由本工具管理（信任 PID 文件，不要求节点名仍然和配置一致）。
 _pid_is_managed_agent() {
-  local pid="$1" exe="" env_server="" env_name=""
+  local pid="$1" exe="" env_server="" env_name="" cfg=""
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
   [ -d "/proc/$pid" ] || return 1
   _is_zombie "$pid" && return 1
   _pid_uses_agent "$pid" || return 1
+
+  # 新版脚本通过 `agent --config <文件>` 启动，进程环境里不再有 APB_*。
+  cfg="$(_pid_arg_value "$pid" --config 2>/dev/null || true)"
+  if [ -n "$cfg" ] && [ "$cfg" = "$CONFIG_FILE" ]; then
+    return 0
+  fi
 
   exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
   if _exe_looks_like_apb "$exe"; then
@@ -935,13 +966,19 @@ _pid_is_managed_agent() {
 
 # 严格判定进程是否匹配当前配置（用于 PID 文件缺失时从 /proc 扫描）。
 _pid_matches_agent() {
-  local pid="$1" exe="" env_name="" env_server=""
+  local pid="$1" exe="" env_name="" env_server="" cfg=""
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
   [ -d "/proc/$pid" ] || return 1
   _is_zombie "$pid" && return 1
   _pid_uses_agent "$pid" || return 1
+
+  # 新版脚本的启动命令里带有当前配置文件路径，优先精确匹配。
+  cfg="$(_pid_arg_value "$pid" --config 2>/dev/null || true)"
+  if [ -n "$cfg" ] && [ "$cfg" = "$CONFIG_FILE" ]; then
+    return 0
+  fi
 
   if [ -n "${NAME:-}" ]; then
     env_name="$(_pid_env_value "$pid" APB_NAME 2>/dev/null || true)"
@@ -994,7 +1031,7 @@ get_running_pid() {
     rm -f -- "$PID_FILE" 2>/dev/null || true
   fi
 
-  # PID 文件缺失（例如旧版脚本启动）时，从 /proc 中按 apb agent 识别。
+  # PID 文件缺失（例如手工启动或 PID 文件被删）时，从 /proc 中按 apb agent 识别。
   for link in /proc/[0-9]*/exe; do
     [ -L "$link" ] || continue
     tmp="${link#/proc/}"
@@ -1152,7 +1189,7 @@ show_config_summary() {
   info "配置确认"
   printf '    服务端   : %s\n' "$SERVER"
   printf '    节点名   : %s\n' "$NAME"
-  printf '    密钥     : 已输入（不显示、不落盘）\n'
+  printf '    密钥     : 已写入配置文件（不显示）\n'
   printf '    下载通道 : %s\n' "$(channel_name)"
   printf '    运行方式 : %s\n' "$run_mode"
   printf '\n'
@@ -1313,9 +1350,9 @@ action_status() {
   printf '    运行方式 : %s\n' "$run_mode"
 
   if [ -n "$KEY" ]; then
-    printf '    APB_KEY  : 已加载（本次会话，不显示）\n'
+    printf '    APB_KEY  : 已配置（配置文件 / 环境变量，不显示）\n'
   else
-    printf '    APB_KEY  : 未加载（启动/重启时输入）\n'
+    printf '    APB_KEY  : 未配置（启动/重启时输入）\n'
   fi
 
   [ -n "${APB_BIN_PATH:-}" ] && candidates+=("$APB_BIN_PATH")
@@ -1456,15 +1493,16 @@ start_agent() {
     : >>"$LOG_FILE" 2>/dev/null || die "无法写入后台日志: $LOG_FILE"
 
     info "后台启动 apb agent ..."
-    # 在子 shell 里 export，避免把密钥放进临时 `env VAR=...` 命令参数。
+    # 配置（含密钥）已经在 600 权限的配置文件里，agent 通过 --config 读取；
+    # 清掉外部残留的连接类 APB_* 环境变量，确保配置文件优先。
     (
-      export APB_SERVER="$SERVER" APB_KEY="$KEY" APB_NAME="$NAME"
+      unset APB_SERVER APB_KEY APB_NAME APB_CONFIG APB_CONFIG_DIR
       if command -v nohup >/dev/null 2>&1; then
-        exec nohup "$APB_BIN_PATH" agent
+        exec nohup "$APB_BIN_PATH" agent --config "$CONFIG_FILE"
       elif command -v setsid >/dev/null 2>&1; then
-        exec setsid "$APB_BIN_PATH" agent
+        exec setsid "$APB_BIN_PATH" agent --config "$CONFIG_FILE"
       else
-        exec "$APB_BIN_PATH" agent
+        exec "$APB_BIN_PATH" agent --config "$CONFIG_FILE"
       fi
     ) >>"$LOG_FILE" 2>&1 < /dev/null &
     pid=$!
@@ -1491,8 +1529,9 @@ start_agent() {
   info "前台运行 apb agent（Ctrl+C 停止）..."
   printf '    节点名 : %s\n' "$NAME"
   printf '    服务端 : %s\n' "$SERVER"
-  export APB_SERVER="$SERVER" APB_KEY="$KEY" APB_NAME="$NAME"
-  exec "$APB_BIN_PATH" agent
+  # 同后台模式：不再 export 环境变量，并以显式 --config 为准。
+  unset APB_SERVER APB_KEY APB_NAME APB_CONFIG APB_CONFIG_DIR
+  exec "$APB_BIN_PATH" agent --config "$CONFIG_FILE"
 }
 
 main() {

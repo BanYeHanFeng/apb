@@ -22,8 +22,8 @@ metadata:
 
 核心约束：
 
-- 只需要服务端地址 + 32 字节密钥；配置只读 `APB_SERVER` / `APB_BIND` / `APB_KEY` / `APB_NAME` 环境变量或命令行参数。
-- 默认端口 `30020`；实际以 `APB_SERVER` / `ss -tlnp` 为准。
+- 只需要服务端地址（必须显式带端口）+ 32 字节密钥；配置优先级为命令行参数 > `APB_*` 环境变量 > `~/.config/apb/agent.conf` 的 `KEY=VALUE` 文件值。
+- 默认不固定端口，不会为省略端口自动补 `30020`；服务端和 agent 都要求显式端口，实际以 `APB_SERVER` / 配置文件 / `ss -tlnp` 为准。
 - `exec` 命令在 agent 的 shell 中执行；服务端只路由，从不替节点执行命令。
 
 ## 本机现成环境速查（本机没有则忽略）
@@ -59,7 +59,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb
 # 菜单：1 启动 / 2 停止 / 3 重启 / 4 安装 / 5 更新 / 6 状态 / 7 配置 / 0 退出
 # 启动 / 重启只使用已安装二进制，不会自动下载；第一次先在菜单选 4 安装。
 # runApb.sh 不接受任何命令行参数，也不提供非交互模式；自动化请直接调用 `apb agent`。
-# 注意：菜单操作会把非密钥配置保存到 ~/.config/apb/agent.conf，APB_KEY 不落盘。
+# 注意：菜单操作会把服务端、密钥、节点名等完整配置保存到 600 权限的 ~/.config/apb/agent.conf；
+# 启动/重启时由 `apb agent --config <文件>` 读取，脚本不再 export APB_* 环境变量。
 ```
 
 静态 musl 构建、CI 与发布说明见 `docs/构建与测试.md`。
@@ -84,7 +85,8 @@ journalctl -u apb-serve -n 50 --no-pager
 # A. Termux / Android：无 root、无 sshd，一条命令打开管理菜单
 bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
 # 首次选 4 安装：询问通道（1 正式版 / 2 预发布版）
-# 再选 1 启动：询问 APB_SERVER、APB_KEY、节点名、运行方式
+# 再选 1 启动：询问 APB_SERVER（必须带端口）、APB_KEY、节点名、运行方式，
+# 并把完整配置写入 ~/.config/apb/agent.conf
 # 之后用 1 启动 / 2 停止 / 3 重启 / 4 安装 / 5 更新 / 6 状态 / 7 配置 / 0 退出
 
 # B. 已有 apb 的 Linux / runner：指定 APB_NAME 后启动
@@ -102,8 +104,8 @@ gh workflow run apb-agent.yml -f ttl_minutes=120 -f name=gh-demo
 ## 四、控制器
 
 ```bash
-# 加载本机参数：控制器同样读 APB_SERVER / APB_KEY 环境变量
-# 密钥文件不存在时跳过下一行，改用外部已有的 APB_KEY
+# 控制器先读 APB_SERVER / APB_KEY 环境变量，没有时自动读 ~/.config/apb/agent.conf
+# 密钥文件不存在时跳过下一行，改用环境变量或配置文件里的 APB_KEY
 set -a; . /root/.secrets/apb_key; set +a
 : "${APB_SERVER:=127.0.0.1:30021}"   # 本机现成服务端；控制远程节点时改成公网 IP:端口
 BIN=${APB_BIN:-apb}
@@ -170,6 +172,6 @@ agent 会打印 `stage=resolve/connect/handshake/hello/hello_reply ... after Nms
 
 ## 七、安全底线
 
-- `APB_KEY` 泄露 = 节点可被接管：不要打印、不要写进仓库 / issue / 日志 / workflow inputs。
-- 控制器优先用 `APB_KEY` 环境变量；`--key` 会出现在本机进程参数和 shell 历史中。
+- `APB_KEY` 泄露 = 节点可被接管：一键脚本只把密钥写进 600 权限的本地配置文件，不要提交它、不要打印、不要写进 issue / 日志 / workflow inputs。
+- 控制命令仍优先用 `APB_KEY` 环境变量；`--key` 会出现在本机进程参数和 shell 历史中。
 - 文件传输只写用户显式指定的路径；服务端只路由，命令只在 agent 的 shell 中执行。
