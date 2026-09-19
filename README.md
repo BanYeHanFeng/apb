@@ -12,20 +12,27 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
 ```
 
-无参数运行会显示 1/2/3 数字菜单：
+直接运行会显示数字菜单（脚本不接受任何命令行选项）：
 
 ```text
-1. 启动 apb agent
-2. 停止 apb agent
-3. 重启 apb agent
-4. 更新 apb 二进制
-5. 查看运行状态
-6. 修改连接配置
+1. 启动 apb
+2. 停止 apb
+3. 重启 apb
+4. 安装 apb（选择正式版 / 预发布版）
+5. 更新 apb
+6. 查看运行状态
+7. 修改连接配置
 0. 退出脚本
 ```
 
-首次启动时脚本会自动检测 CPU 架构，并依次询问：
-- 下载通道（1 正式版 latest / 2 预发布 pre-release，回车默认 1）
+选择菜单中的 `4. 安装 apb` 时，脚本会：
+- 自动检测 CPU 架构（`x86_64` / `aarch64`）
+- 询问安装通道（`1` 正式版 latest / `2` 预发布版 pre-release，需要明确选择）
+- 下载并覆盖安装到安装目录，不启动 agent
+
+> 启动 / 重启只使用已经安装好的 `apb`，不会自动下载。未安装时会提示先返回菜单选择 `4. 安装 apb`。
+
+安装后选择 `1. 启动 apb` 时，脚本才会依次询问：
 - 服务端地址（`IP:端口`，缺省端口 `30020`）
 - `APB_KEY`（64 位 hex，输入不回显）
 - 节点名（回车使用 `USER@HOSTNAME`）
@@ -33,12 +40,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb
 
 服务端地址、节点名、下载通道和运行方式会保存到 `~/.config/apb/agent.conf`（权限 600），方便下次启动和重启；`APB_KEY` 不写入配置文件，启动/重启时单独输入。
 
-也可以跳过菜单直接执行命令：`start` / `stop` / `restart` / `update` / `status` / `config`（等价数字 `1`~`6`）。
-非交互场景仍可按原方式启动，或使用 `--pre` / `--channel prerelease` / `APB_CHANNEL=prerelease` 直接选择预发布：
+`runApb.sh` 只支持“无参数 + 交互式终端”的运行方式，不接受任何命令行选项；安装、启动、更新等操作都请按数字菜单提示完成。
+
+如所在网络无法直接访问 GitHub，可在运行脚本时通过环境变量指定镜像前缀，再在菜单中选择 `4. 安装 apb`：
 
 ```bash
-APB_SERVER=1.2.3.4:30020 APB_KEY=... APB_NAME=node-a \
-  bash runApb.sh --yes --background
+APB_GH_PROXY='https://gh-proxy.example' \
+  bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
 ```
 
 ## 文档

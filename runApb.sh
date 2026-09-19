@@ -1,38 +1,28 @@
 #!/usr/bin/env bash
 #
-# apb 客户端综合管理脚本（1/2/3 数字菜单）：
-#   启动 / 停止 / 重启 agent、更新 apb 二进制、查看状态、修改连接配置。
+# apb 客户端综合管理脚本（纯数字菜单）：
+#   启动 / 停止 / 重启 agent、安装 / 更新 apb 二进制、查看状态、修改连接配置。
 #
-# 推荐用法（stdin 仍留给终端，脚本读取 /dev/tty，所以可以放心交互）：
+# 用法（仅支持在交互式终端中无参数运行；不接受任何命令行选项）：
 #   bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
-#   无参数运行会显示数字菜单，适合日常管理。
+#   无参数运行会显示数字菜单，所有操作都在菜单中完成。
 #
-# 非交互 / CI 用法（保持原有一次性启动方式）：
-#   APB_SERVER=1.2.3.4:30020 APB_KEY=64位hex APB_NAME=node-a \
-#     bash runApb.sh --yes --background
-#
-# 只安装/更新二进制，不启动：
-#   bash runApb.sh --install-only
-#   bash runApb.sh update
-#
-# 环境变量（除了与 apb 一致的前三个，其余都只影响本脚本）：
+# 环境变量（只影响对应菜单项的默认值，不提供绕过菜单的一次性执行入口）：
 #   APB_SERVER / APB_KEY / APB_NAME   服务端地址、密钥、节点名
 #   APB_CONFIG                        管理配置文件，默认 ~/.config/apb/agent.conf
 #   APB_CONFIG_DIR                    管理配置目录，默认 ~/.config/apb
 #   APB_PID_FILE                      agent PID 文件，默认 <配置目录>/agent.pid
 #   APB_INSTALL_DIR                   二进制安装目录，默认 ~/.local/bin
-#   APB_BIN                           已存在的 apb 二进制，设置后跳过下载
+#   APB_BIN                           已存在的 apb 二进制，安装菜单中复用
 #   APB_BINARY_URL                    直接指定二进制下载地址
 #   APB_REPO                          GitHub 仓库，默认 BanYeHanFeng/apb
-#   APB_CHANNEL                       下载通道，stable（默认）/ prerelease；未设置时交互脚本会询问
+#   APB_CHANNEL                       安装/更新默认通道，stable（默认）/ prerelease
 #   APB_PRE_RELEASE_TAG               预发布 Release 标签，默认 pre-release
-#   APB_VERSION                       Release 版本，默认 latest；填写具体 v* 时优先于通道
+#   APB_VERSION                       Release 版本，默认 latest
 #   APB_RELEASE_BASE                  Release 下载页，默认 https://github.com/$APB_REPO/releases
 #   APB_GH_PROXY                      GitHub 加速前缀，按 <前缀>/<完整URL> 拼装
 #   APB_LOG                           后台日志路径，默认可写的临时目录或 HOME 下 apb-agent-<name>.log
-#   APB_BACKGROUND=1                  等价于 --background
-#   APB_YES=1                         等价于 --yes
-#   APB_UPDATE=1                      等价于 --update，强制重新下载
+#   APB_BACKGROUND=1                  启动时默认后台运行；0 默认前台
 #   APB_TARGET                        覆盖自动检测的 Rust target / 资产后缀
 #
 # 说明：
@@ -40,17 +30,14 @@
 #   （权限 600），方便下次启动 / 重启；APB_KEY 不写入配置文件，只在启动/重启时
 #   通过 /dev/tty 无回显读取后以环境变量传给 agent。
 #
-
 set -Eeuo pipefail
 
 DEFAULT_REPO="${APB_REPO:-BanYeHanFeng/apb}"
 DEFAULT_PORT=30020
 DEFAULT_INSTALL_DIR="${APB_INSTALL_DIR:-${HOME:-.}/.local/bin}"
 DEFAULT_RELEASE_BASE="${APB_RELEASE_BASE:-https://github.com/${DEFAULT_REPO}/releases}"
-ASSUME_YES="${APB_YES:-0}"
 BACKGROUND_MODE="${APB_BACKGROUND:-ask}"   # ask / 1 / 0
-INSTALL_ONLY=0
-FORCE_UPDATE="${APB_UPDATE:-0}"
+FORCE_UPDATE=0
 BIN_OVERRIDE="${APB_BIN:-}"
 BINARY_URL="${APB_BINARY_URL:-}"
 SERVER="${APB_SERVER:-}"
@@ -67,9 +54,6 @@ PRE_RELEASE_TAG="${APB_PRE_RELEASE_TAG:-pre-release}"
 VERSION="${APB_VERSION:-latest}"
 RELEASE_BASE="${DEFAULT_RELEASE_BASE%/}"
 GH_PROXY="${APB_GH_PROXY:-}"
-REQUESTED_SERVER=""
-REQUESTED_KEY=""
-REQUESTED_NAME=""
 APB_BIN_PATH=""
 APB_BIN_VERSION=""
 SERVER_NORM=""
@@ -87,13 +71,11 @@ CONFIG_BASE_DIR="$(dirname -- "$CONFIG_FILE" 2>/dev/null || printf '.')"
 [ -n "$CONFIG_BASE_DIR" ] || CONFIG_BASE_DIR="."
 PID_FILE="${APB_PID_FILE:-${CONFIG_BASE_DIR}/agent.pid}"
 
-# 运行模式：menu / legacy / start / stop / restart / update / status / config。
-ACTION=""
+# 纯数字菜单模式。
 PERSIST_CONFIG=0
 CONFIG_LOADED=0
-INSTALL_DIR_EXPLICIT=0
 
-# 只允许从终端读取输入；没有终端时所有参数都必须通过环境变量/参数提供。
+# 只允许从终端读取输入；没有终端时无法显示数字菜单。
 INPUT_FROM_TTY=0
 if { : </dev/tty; } 2>/dev/null; then
   INPUT_FROM_TTY=1
@@ -114,72 +96,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-usage() {
-  cat <<EOF
-apb 客户端综合管理脚本（数字菜单版）
 
-用法:
-  bash <(curl -fsSL https://raw.githubusercontent.com/${DEFAULT_REPO}/main/runApb.sh)
-                                   # 无参数且终端可用时显示 1/2/3 数字菜单
-  bash runApb.sh [命令] [选项]
-
-命令:
-  1 | start      启动 apb agent
-  2 | stop       停止 apb agent
-  3 | restart    重启 apb agent
-  4 | update     重新下载最新 apb 二进制
-  5 | status     查看运行状态
-  6 | config     修改连接配置（APB_KEY 仅本次会话生效，不落盘）
-  0 | menu       显示数字菜单
-
-本脚本会:
-  1. 检测 Linux 架构（x86_64 / aarch64）；
-  2. 交互选择下载通道（1 正式版 / 2 预发布，回车默认正式版；非交互时用选项或环境变量指定）；
-  3. 下载对应的静态 apb 到安装目录；
-  4. 交互询问服务端地址、APB_KEY、节点名和运行方式；
-  5. 通过数字菜单启动、停止、重启、更新和查看 agent。
-
-选项:
-  -s, --server IP:PORT   服务端地址，缺省端口 ${DEFAULT_PORT}
-  -k, --key KEY          64 位 hex 密钥（或 base64:...；会留在 shell 历史，建议用 APB_KEY）
-  -n, --name NAME        节点名
-  -b, --background       后台运行（默认）
-  -f, --foreground       前台运行，Ctrl+C 停止
-  -y, --yes              不交互，使用已有参数 / 默认运行方式；缺少必填项则报错
-  -c, --channel CHANNEL  下载通道：stable 正式版（默认）/ prerelease 预发布
-      --stable           等价于 --channel stable
-      --pre, --prerelease
-                         等价于 --channel prerelease
-      --install-only     只下载/校验二进制，不启动 agent
-      --update           强制重新下载最新二进制
-      --menu             强制显示数字菜单
-      --binary PATH      使用已有 apb 二进制，不下载
-      --repo OWNER/REPO  指定 GitHub 仓库，默认 ${DEFAULT_REPO}
-      --release-base URL 指定 Release 地址前缀
-      --install-dir DIR  指定安装目录，默认 ${DEFAULT_INSTALL_DIR}
-      --target TARGET    覆盖自动检测的 Release 资产后缀
-      --binary-url URL   直接指定二进制下载地址，跳过 Release 拼接
-  -h, --help             显示帮助
-      --version          显示本脚本版本
-
-示例:
-  bash runApb.sh                     # 打开管理菜单
-  bash runApb.sh start               # 下载（如需要）并启动 agent
-  bash runApb.sh 5                   # 查看运行状态
-  APB_SERVER=1.2.3.4:30020 APB_KEY=\$(apb keygen) APB_NAME=phone-a \\
-    APB_CHANNEL=prerelease bash runApb.sh --yes --background
-
-配置与安全:
-  无参数进入菜单（或执行 start/restart/config 命令）后，会把服务端地址、节点名、下载通道、
-  运行方式等非密钥信息保存到 ${CONFIG_FILE}（权限 600）。
-  APB_KEY 不回显、不写入配置文件，只在启动/重启时读取并通过环境变量传给 agent。
-  不要把密钥写进 issue、日志或公开仓库；泄露后请立即轮换服务端与所有 agent 的密钥。
-EOF
-}
-
-version() {
-  printf 'runApb.sh (apb client manager)\n'
-}
 
 normalize_channel() {
   local value
@@ -199,151 +116,24 @@ normalize_channel() {
 
 channel_name() {
   if [ "$CHANNEL" = "prerelease" ]; then
-    printf '预发布'
+    printf '预发布版'
   else
     printf '正式版'
   fi
 }
 
-parse_args() {
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -s|--server)
-        [ "$#" -ge 2 ] || die "$1 缺少参数"
-        REQUESTED_SERVER="$2"; shift 2
-        ;;
-      --server=*)
-        REQUESTED_SERVER="${1#*=}"; shift
-        ;;
-      -k|--key)
-        [ "$#" -ge 2 ] || die "$1 缺少参数"
-        REQUESTED_KEY="$2"; shift 2
-        ;;
-      --key=*)
-        REQUESTED_KEY="${1#*=}"; shift
-        ;;
-      -n|--name)
-        [ "$#" -ge 2 ] || die "$1 缺少参数"
-        REQUESTED_NAME="$2"; shift 2
-        ;;
-      --name=*)
-        REQUESTED_NAME="${1#*=}"; shift
-        ;;
-      -b|--background)
-        BACKGROUND_MODE=1; shift
-        ;;
-      -f|--foreground)
-        BACKGROUND_MODE=0; shift
-        ;;
-      -y|--yes)
-        ASSUME_YES=1; shift
-        ;;
-      --install-only)
-        INSTALL_ONLY=1; shift
-        ;;
-      --update)
-        FORCE_UPDATE=1; shift
-        ;;
-      --menu)
-        ACTION="menu"; shift
-        ;;
-      --binary)
-        [ "$#" -ge 2 ] || die "$1 缺少参数"
-        BIN_OVERRIDE="$2"; shift 2
-        ;;
-      --binary=*)
-        BIN_OVERRIDE="${1#*=}"; shift
-        ;;
-      --install-dir)
-        [ "$#" -ge 2 ] || die "$1 缺少参数"
-        DEFAULT_INSTALL_DIR="$2"; INSTALL_DIR_EXPLICIT=1; shift 2
-        ;;
-      --install-dir=*)
-        DEFAULT_INSTALL_DIR="${1#*=}"; INSTALL_DIR_EXPLICIT=1; shift
-        ;;
-      --target)
-        [ "$#" -ge 2 ] || die "$1 缺少参数"
-        TARGET_OVERRIDE="$2"; shift 2
-        ;;
-      --target=*)
-        TARGET_OVERRIDE="${1#*=}"; shift
-        ;;
-      --binary-url)
-        [ "$#" -ge 2 ] || die "$1 缺少参数"
-        BINARY_URL="$2"; shift 2
-        ;;
-      --binary-url=*)
-        BINARY_URL="${1#*=}"; shift
-        ;;
-      --repo)
-        [ "$#" -ge 2 ] || die "$1 缺少参数"
-        DEFAULT_REPO="$2"
-        RELEASE_BASE="${APB_RELEASE_BASE:-https://github.com/${DEFAULT_REPO}/releases}"
-        RELEASE_BASE="${RELEASE_BASE%/}"
-        shift 2
-        ;;
-      --repo=*)
-        DEFAULT_REPO="${1#*=}"
-        RELEASE_BASE="${APB_RELEASE_BASE:-https://github.com/${DEFAULT_REPO}/releases}"
-        RELEASE_BASE="${RELEASE_BASE%/}"
-        shift
-        ;;
-      --release-base)
-        [ "$#" -ge 2 ] || die "$1 缺少参数"
-        RELEASE_BASE="${2%/}"; shift 2
-        ;;
-      --release-base=*)
-        RELEASE_BASE="${1#*=}"; RELEASE_BASE="${RELEASE_BASE%/}"; shift
-        ;;
-      -c|--channel)
-        [ "$#" -ge 2 ] || die "$1 缺少参数"
-        CHANNEL="$2"; CHANNEL_EXPLICIT=1; shift 2
-        ;;
-      --channel=*)
-        CHANNEL="${1#*=}"; CHANNEL_EXPLICIT=1; shift
-        ;;
-      --stable)
-        CHANNEL="stable"; CHANNEL_EXPLICIT=1; shift
-        ;;
-      --pre|--prerelease)
-        CHANNEL="prerelease"; CHANNEL_EXPLICIT=1; shift
-        ;;
-      -h|--help)
-        usage; exit 0
-        ;;
-      --version)
-        version; exit 0
-        ;;
-      --)
-        shift
-        [ "$#" -eq 0 ] || die "未知参数: $1"
-        break
-        ;;
-      -*)
-        die "未知参数: $1"
-        ;;
-      *)
-        die "未知位置参数: $1"
-        ;;
-    esac
-  done
 
-  [ -n "$REQUESTED_SERVER" ] && SERVER="$REQUESTED_SERVER"
-  [ -n "$REQUESTED_KEY" ] && KEY="$REQUESTED_KEY"
-  [ -n "$REQUESTED_NAME" ] && NAME="$REQUESTED_NAME"
-
-  case "$ASSUME_YES" in 1|true|TRUE|yes|YES) ASSUME_YES=1 ;; *) ASSUME_YES=0 ;; esac
+normalize_env_defaults() {
   case "$BACKGROUND_MODE" in
     1|true|TRUE|yes|YES) BACKGROUND_MODE=1 ;;
     0|false|FALSE|no|NO) BACKGROUND_MODE=0 ;;
     ask|"") BACKGROUND_MODE=ask ;;
     *) die "APB_BACKGROUND 值无效: $BACKGROUND_MODE" ;;
   esac
-  case "$FORCE_UPDATE" in 1|true|TRUE|yes|YES) FORCE_UPDATE=1 ;; *) FORCE_UPDATE=0 ;; esac
 
   local normalized_channel
   if ! normalized_channel="$(normalize_channel "$CHANNEL")"; then
-    die "下载通道无效: ${CHANNEL}（可选 stable 正式版 / prerelease 预发布）"
+    die "APB_CHANNEL 无效: ${CHANNEL}（可选 stable 正式版 / prerelease 预发布版）"
   fi
   CHANNEL="$normalized_channel"
 }
@@ -672,13 +462,8 @@ ask_channel() {
   if [ -n "$VERSION" ] && [ "$VERSION" != "latest" ]; then
     return 0
   fi
-  if [ "$ASSUME_YES" -eq 1 ] || [ "$INPUT_FROM_TTY" -eq 0 ]; then
-    CHANNEL="stable"
-    return 0
-  fi
-
   while :; do
-    prompt_read ans "请输入下载通道（1=正式版 latest，2=预发布 pre-release，回车默认 1）: " 0 \
+    prompt_read ans "请输入下载通道（1=正式版 latest，2=预发布版 pre-release，回车默认 1）: " 0 \
       || die "没有可用的终端输入，无法询问下载通道"
     ans="$(trim "$ans")"
     case "${ans:-1}" in
@@ -686,9 +471,9 @@ ask_channel() {
         CHANNEL="stable"
         return 0
         ;;
-      2|pre|pre-release|prerelease|preview|beta|预发布|预发布版|预览|预览版)
+      2|pre|pre-release|prerelease|preview|beta|预发布版|预发布|预览版|预览)
         CHANNEL="prerelease"
-        # 用户主动选择预发布时跳过本地 / 旧缓存二进制，确保从预发布 Release 下载。
+        # 用户主动选择预发布版时跳过本地 / 旧缓存二进制，确保从预发布 Release 下载。
         CHANNEL_EXPLICIT=1
         return 0
         ;;
@@ -702,24 +487,22 @@ ask_channel() {
 ask_server() {
   local ans
   while :; do
-    if [ "$ASSUME_YES" -eq 1 ] && [ -z "$SERVER" ]; then
-      die "缺少服务端地址"
-    fi
     if [ -n "$SERVER" ]; then
       if normalize_server "$SERVER"; then
         SERVER="$SERVER_NORM"
         return 0
       fi
-      if [ "$INPUT_FROM_TTY" -eq 0 ] || [ "$ASSUME_YES" -eq 1 ]; then
+      if [ "$INPUT_FROM_TTY" -eq 0 ]; then
         die "APB_SERVER 格式非法: $SERVER"
       fi
       warn "已有 APB_SERVER 格式非法: $SERVER"
       SERVER=""
     fi
     if [ "$INPUT_FROM_TTY" -eq 0 ]; then
-      die "缺少服务端地址"
+      die "没有可用的终端输入，无法询问 APB_SERVER"
     fi
-    prompt_read ans "请输入服务端地址（IP:端口，可省略端口，默认 ${DEFAULT_PORT}）: " 0 || die "没有可用的终端输入，无法询问 APB_SERVER"
+    prompt_read ans "请输入服务端地址（IP:端口，可省略端口，默认 ${DEFAULT_PORT}）: " 0 \
+      || die "没有可用的终端输入，无法询问 APB_SERVER"
     ans="$(trim "$ans")"
     if [ -z "$ans" ]; then
       warn "服务端地址不能为空。"
@@ -737,21 +520,18 @@ ask_server() {
 ask_key() {
   local ans
   while :; do
-    if [ "$ASSUME_YES" -eq 1 ] && [ -z "$KEY" ]; then
-      die "缺少 APB_KEY"
-    fi
     if [ -n "$KEY" ]; then
       if validate_key "$KEY"; then
         return 0
       fi
-      if [ "$INPUT_FROM_TTY" -eq 0 ] || [ "$ASSUME_YES" -eq 1 ]; then
+      if [ "$INPUT_FROM_TTY" -eq 0 ]; then
         die "APB_KEY 格式非法"
       fi
       warn "已有 APB_KEY 格式非法"
       KEY=""
     fi
     if [ "$INPUT_FROM_TTY" -eq 0 ]; then
-      die "缺少 APB_KEY"
+      die "没有可用的终端输入，无法询问 APB_KEY"
     fi
     prompt_read ans "请输入 APB_KEY（64 位 hex，输入不回显）: " 1 || die "没有可用的终端输入，无法询问 APB_KEY"
     ans="$(trim "$ans")"
@@ -772,24 +552,19 @@ ask_name() {
   local fallback ans
   fallback="$(default_name)"
   while :; do
-    if [ "$ASSUME_YES" -eq 1 ] && [ -z "$NAME" ]; then
-      NAME="$fallback"
-      return 0
-    fi
     if [ -n "$NAME" ]; then
       NAME="$(trim "$NAME")"
       if validate_name "$NAME"; then
         return 0
       fi
-      if [ "$INPUT_FROM_TTY" -eq 0 ] || [ "$ASSUME_YES" -eq 1 ]; then
+      if [ "$INPUT_FROM_TTY" -eq 0 ]; then
         die "APB_NAME 格式非法: $NAME"
       fi
       warn "已有 APB_NAME 格式非法: $NAME"
       NAME=""
     fi
     if [ "$INPUT_FROM_TTY" -eq 0 ]; then
-      NAME="$fallback"
-      return 0
+      die "没有可用的终端输入，无法询问 APB_NAME"
     fi
     prompt_read ans "请输入节点名称（回车使用 ${fallback}）: " 0 || die "没有可用的终端输入，无法询问 APB_NAME"
     ans="$(trim "$ans")"
@@ -812,13 +587,9 @@ ask_background() {
     1|0) return 0 ;;
   esac
 
-  if [ "$ASSUME_YES" -eq 1 ] || [ "$INPUT_FROM_TTY" -eq 0 ]; then
-    BACKGROUND_MODE=1
-    return 0
-  fi
-
   while :; do
-    prompt_read ans "请输入运行方式（1 后台运行，2 前台运行，回车默认 1）: " 0 || die "没有可用的终端输入，无法询问运行方式"
+    prompt_read ans "请输入运行方式（1 后台运行，2 前台运行，回车默认 1）: " 0 \
+      || die "没有可用的终端输入，无法询问运行方式"
     ans="$(trim "$ans")"
     case "${ans:-1}" in
       1|y|Y|yes|YES|Yes|后台) BACKGROUND_MODE=1; return 0 ;;
@@ -856,7 +627,7 @@ ensure_config_dir() {
   return 0
 }
 
-# 读取配置，只填充当前尚未由环境变量/命令行指定的非密钥字段。
+# 读取配置，只填充当前尚未由环境变量指定的非密钥字段。
 load_config() {
   local line key value normalized perm found=0
   [ -n "${CONFIG_FILE:-}" ] || return 0
@@ -902,7 +673,7 @@ load_config() {
         fi
         ;;
       APB_INSTALL_DIR)
-        if [ "$INSTALL_DIR_EXPLICIT" -eq 0 ] && [ -z "${APB_INSTALL_DIR:-}" ] && [ -n "$value" ]; then
+        if [ -z "${APB_INSTALL_DIR:-}" ] && [ -n "$value" ]; then
           DEFAULT_INSTALL_DIR="$value"
           found=1
         fi
@@ -1040,11 +811,11 @@ edit_channel() {
   require_tty
   [ "$CHANNEL" = "prerelease" ] && default=2
   while :; do
-    prompt_read ans "下载通道（1 正式版，2 预发布，回车保持 $(channel_name)）: " 0 || die "没有可用的终端输入"
+    prompt_read ans "下载通道（1 正式版，2 预发布版，回车保持 $(channel_name)）: " 0 || die "没有可用的终端输入"
     ans="$(trim "$ans")"
     case "${ans:-$default}" in
       1|stable|release|正式版|正式) CHANNEL="stable"; CHANNEL_EXPLICIT=1; return 0 ;;
-      2|pre|prerelease|pre-release|preview|beta|预发布|预发布版) CHANNEL="prerelease"; CHANNEL_EXPLICIT=1; return 0 ;;
+      2|pre|prerelease|pre-release|preview|beta|预发布版|预发布) CHANNEL="prerelease"; CHANNEL_EXPLICIT=1; return 0 ;;
       *) warn "输入无效: ${ans}（请输入 1 或 2）" ;;
     esac
   done
@@ -1271,7 +1042,7 @@ stop_agent() {
   return 0
 }
 
-# ================= 启动 / 更新 / 状态 =================
+# ================= 启动 / 安装 / 更新 / 状态 =================
 
 resolve_log_file() {
   local safe_name log_dir
@@ -1310,6 +1081,68 @@ prepare_agent_binary() {
   return 0
 }
 
+# 启动/重启只用已存在的二进制，绝不下载；没装时提示去菜单 4 安装。
+resolve_installed_binary() {
+  local candidate mark_file="" existing_channel=""
+  APB_BIN_PATH=""
+  APB_BIN_VERSION=""
+
+  if [ -n "$BIN_OVERRIDE" ]; then
+    BIN_OVERRIDE="$(cd -- "$(dirname -- "$BIN_OVERRIDE")" 2>/dev/null && pwd)/$(basename -- "$BIN_OVERRIDE")"
+    if ! validate_binary "$BIN_OVERRIDE"; then
+      error "指定的 APB_BIN 不可用或不是 apb 二进制: $BIN_OVERRIDE"
+      return 1
+    fi
+    APB_BIN_PATH="$BIN_OVERRIDE"
+    return 0
+  fi
+
+  local -a candidates=()
+  # 默认通道下仍优先复用脚本目录 / 当前目录中的 apb，方便仓库内直接启动；
+  # 显式配置了通道时只认同安装目录 / PATH 中的已安装二进制。
+  if [ "$CHANNEL_EXPLICIT" -ne 1 ]; then
+    [ -n "$SCRIPT_DIR" ] && candidates+=("$SCRIPT_DIR/apb")
+    candidates+=("./apb" "$PWD/apb")
+  fi
+  [ -n "${DEFAULT_INSTALL_DIR:-}" ] && candidates+=("${DEFAULT_INSTALL_DIR%/}/apb")
+  if command -v apb >/dev/null 2>&1; then
+    candidates+=("$(command -v apb)")
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    [ -n "$candidate" ] || continue
+    if validate_binary "$candidate"; then
+      APB_BIN_PATH="$(cd -- "$(dirname -- "$candidate")" 2>/dev/null && pwd)/$(basename -- "$candidate")"
+      if [ -n "${DEFAULT_INSTALL_DIR:-}" ] && [ "$APB_BIN_PATH" = "${DEFAULT_INSTALL_DIR%/}/apb" ]; then
+        mark_file="${DEFAULT_INSTALL_DIR%/}/.apb-channel"
+        if [ -f "$mark_file" ]; then
+          existing_channel="$(cat -- "$mark_file" 2>/dev/null || true)"
+          if [ -n "$existing_channel" ] && [ "$existing_channel" != "$CHANNEL" ]; then
+            warn "已安装二进制来自 ${existing_channel} 通道，当前配置为 $(channel_name)；如需切换请先在菜单选择 4. 安装 apb"
+          fi
+        fi
+      fi
+      return 0
+    fi
+  done
+
+  error "未找到已安装的 apb 二进制；请先在菜单选择 4. 安装 apb"
+  return 1
+}
+
+prepare_installed_binary() {
+  check_platform
+  if [ -n "$BINARY_URL" ]; then
+    warn "已设置 APB_BINARY_URL，但启动/重启不会自动下载，将使用已安装的 apb"
+  fi
+  if ! resolve_installed_binary; then
+    return 1
+  fi
+  APB_BIN_VERSION="${APB_BIN_VERSION:-$("$APB_BIN_PATH" --version 2>/dev/null || printf 'apb')}"
+  info "使用已安装二进制: ${APB_BIN_PATH} (${APB_BIN_VERSION})"
+  return 0
+}
+
 show_config_summary() {
   local run_mode="后台"
   if [ "$BACKGROUND_MODE" = "0" ]; then
@@ -1330,7 +1163,7 @@ action_stop() {
 }
 
 action_start() {
-  prepare_agent_binary
+  prepare_installed_binary || return 1
   ask_server
   ask_key
   ask_name
@@ -1341,7 +1174,7 @@ action_start() {
 }
 
 action_restart() {
-  prepare_agent_binary
+  prepare_installed_binary || return 1
   ask_server
   ask_key
   ask_name
@@ -1363,9 +1196,87 @@ action_update() {
   ok "apb 二进制已更新: ${APB_BIN_PATH} (${APB_BIN_VERSION})"
   if [ -n "$running" ]; then
     info "agent 正在运行 (PID: $running)，新二进制将在下次重启时生效"
-    info "可返回菜单选择 3. 重启 apb agent"
+    info "可返回菜单选择 3. 重启 apb"
   fi
   return 0
+}
+
+# 安装菜单显示的版本名称，使用“正式版 / 预发布版”区分。
+install_channel_name() {
+  if [ "$CHANNEL" = "prerelease" ]; then
+    printf '预发布版（pre-release）'
+  else
+    printf '正式版（latest）'
+  fi
+}
+
+# 安装/切换 apb 二进制：按当前 CHANNEL 强制重新下载。
+action_install_binary() {
+  local running="" saved_force_update="$FORCE_UPDATE"
+  check_platform
+  running="$(get_running_pid || true)"
+  FORCE_UPDATE=1
+  prepare_agent_binary
+  FORCE_UPDATE="$saved_force_update"
+  persist_config
+  ok "apb 二进制已安装: ${APB_BIN_PATH} (${APB_BIN_VERSION})"
+  printf '    安装版本 : %s\n' "$(install_channel_name)"
+  if [ -n "$running" ]; then
+    info "agent 正在运行 (PID: $running)，新二进制将在下次重启时生效"
+    info "可返回主菜单选择 3. 重启 apb"
+  fi
+  return 0
+}
+
+# 菜单项 4：选择正式版 / 预发布版后调用 action_install_binary。
+action_install_menu() {
+  local choice=""
+  require_tty
+  printf '\n'
+  info "安装 apb"
+  printf '  1. 正式版（latest Release）\n'
+  printf '  2. 预发布版（pre-release 滚动构建）\n'
+  printf '  0. 返回主菜单\n'
+  if [ "$VERSION" != "latest" ]; then
+    warn "APB_VERSION=${VERSION} 已指定，将改为安装所选通道的 latest 版本"
+  fi
+  if [ -n "$BINARY_URL" ]; then
+    warn "APB_BINARY_URL 已指定，将忽略版本选择并从自定义地址下载"
+  fi
+  if [ -n "$BIN_OVERRIDE" ]; then
+    warn "APB_BIN 已指定，将复用该二进制，不下载所选版本"
+  fi
+  while :; do
+    if ! prompt_read choice "请选择要安装的版本 [0-2]: " 0; then
+      printf '\n' >&2
+      return 0
+    fi
+    choice="$(trim "$choice")"
+    case "$choice" in
+      1|stable|release|latest|正式版)
+        CHANNEL="stable"
+        CHANNEL_EXPLICIT=1
+        VERSION="latest"
+        info "已选择正式版（latest Release）"
+        break
+        ;;
+      2|pre|prerelease|pre-release|preview|beta|预发布版|预发布)
+        CHANNEL="prerelease"
+        CHANNEL_EXPLICIT=1
+        VERSION="latest"
+        info "已选择预发布版（pre-release 滚动构建）"
+        break
+        ;;
+      0|q|exit|quit|返回)
+        info "已取消安装"
+        return 0
+        ;;
+      *)
+        warn "输入无效: ${choice:-空}（请输入 0-2）"
+        ;;
+    esac
+  done
+  action_install_binary
 }
 
 action_status() {
@@ -1433,21 +1344,6 @@ action_status() {
   return 0
 }
 
-legacy_start() {
-  check_platform
-  prepare_agent_binary
-  if [ "$INSTALL_ONLY" -eq 1 ]; then
-    ok "apb 二进制已就绪，未启动 agent。"
-    return 0
-  fi
-  ask_server
-  ask_key
-  ask_name
-  ask_background
-  show_config_summary
-  start_agent
-}
-
 # ================= 数字菜单 =================
 
 show_menu() {
@@ -1470,12 +1366,15 @@ show_menu() {
   节点名  : ${NAME:-未配置}
   当前状态: ${status_line}
 -------------------------------------
-  1. 启动 apb agent
-  2. 停止 apb agent
-  3. 重启 apb agent
-  4. 更新 apb 二进制
-  5. 查看运行状态
-  6. 修改连接配置
+  1. 启动 apb
+  2. 停止 apb
+  3. 重启 apb
+
+  4. 安装 apb
+  5. 更新 apb
+
+  6. 查看运行状态
+  7. 修改连接配置
   0. 退出脚本
 =====================================
 EOF
@@ -1491,35 +1390,38 @@ pause_return() {
 interactive_menu() {
   local choice="" rc=0
   if [ "$INPUT_FROM_TTY" -eq 0 ]; then
-    die "当前没有可用的终端，无法显示菜单（可使用 start/stop/restart/update/status 命令）"
+    die "当前没有可用的终端，无法显示数字菜单；请在交互式终端中直接运行本脚本"
   fi
 
   PERSIST_CONFIG=1
   while :; do
     show_menu
-    if ! prompt_read choice "请输入选项 [0-6]: " 0; then
+    if ! prompt_read choice "请输入选项 [0-7]: " 0; then
       printf '\n' >&2
       return 0
     fi
     choice="$(trim "$choice")"
     printf '\n'
     case "$choice" in
-      1|start)
+      1)
         if action_start; then rc=0; else rc=$?; warn "启动操作失败（退出码 $rc）"; fi
         ;;
-      2|stop)
+      2)
         if stop_agent; then rc=0; else rc=$?; warn "停止操作失败（退出码 $rc）"; fi
         ;;
-      3|restart)
+      3)
         if action_restart; then rc=0; else rc=$?; warn "重启操作失败（退出码 $rc）"; fi
         ;;
-      4|update)
+      4)
+        if action_install_menu; then rc=0; else rc=$?; warn "安装操作失败（退出码 $rc）"; fi
+        ;;
+      5)
         if action_update; then rc=0; else rc=$?; warn "更新操作失败（退出码 $rc）"; fi
         ;;
-      5|status)
+      6)
         if action_status; then rc=0; else rc=$?; warn "状态查询失败（退出码 $rc）"; fi
         ;;
-      6|config)
+      7)
         if action_config; then rc=0; else rc=$?; warn "配置修改失败（退出码 $rc）"; fi
         ;;
       0|exit|quit|q)
@@ -1527,7 +1429,7 @@ interactive_menu() {
         return 0
         ;;
       *)
-        warn "无效选项: ${choice:-空}（请输入 0-6）"
+        warn "无效选项: ${choice:-空}（请输入 0-7）"
         ;;
     esac
     pause_return || return 0
@@ -1577,7 +1479,7 @@ start_agent() {
       printf '    服务端   : %s\n' "$SERVER"
       printf '    进程 PID : %s\n' "$pid"
       printf '    日志     : %s\n' "$LOG_FILE"
-      printf '    停止方式 : 运行本脚本，选择 2. 停止 apb agent\n'
+      printf '    停止方式 : 运行本脚本，选择 2. 停止 apb\n'
       return 0
     fi
 
@@ -1594,48 +1496,19 @@ start_agent() {
 }
 
 main() {
-  local action="$ACTION" original_argc=$#
-
-  # 支持 1/2/3 数字命令，以及 start / stop / restart / update / status / config。
+  # 所有基于命令行参数的一次性执行入口均已删除，只保留交互式数字菜单。
   if [ "$#" -gt 0 ]; then
-    case "$1" in
-      menu)        action="menu"; shift ;;
-      0)           action="menu"; shift ;;
-      1|start|run) action="start"; shift ;;
-      2|stop)      action="stop"; shift ;;
-      3|restart)   action="restart"; shift ;;
-      4|update)    action="update"; shift ;;
-      5|status)    action="status"; shift ;;
-      6|config|configure) action="config"; shift ;;
-    esac
+    error "本脚本不接受任何命令行参数，请直接运行后使用数字菜单。"
+    exit 2
+  fi
+  if [ "$INPUT_FROM_TTY" -eq 0 ]; then
+    die "当前没有可用的终端，无法显示数字菜单；请在交互式终端中直接运行本脚本"
   fi
 
-  parse_args "$@"
-  if [ -n "$ACTION" ]; then
-    action="$ACTION"
-  fi
+  normalize_env_defaults
   load_config
-
-  # 无参数 + 有终端 + 未强制 --yes：进入数字菜单；否则保持原一次性启动行为。
-  if [ -z "$action" ]; then
-    if [ "$original_argc" -eq 0 ] && [ "$INPUT_FROM_TTY" -ne 0 ] && [ "$ASSUME_YES" -ne 1 ]; then
-      action="menu"
-    else
-      action="legacy"
-    fi
-  fi
-
-  case "$action" in
-    menu)    PERSIST_CONFIG=1; interactive_menu ;;
-    start)   PERSIST_CONFIG=1; action_start ;;
-    stop)    action_stop ;;
-    restart) PERSIST_CONFIG=1; action_restart ;;
-    update)  PERSIST_CONFIG=1; action_update ;;
-    status)  action_status ;;
-    config)  PERSIST_CONFIG=1; action_config ;;
-    legacy)  PERSIST_CONFIG=0; legacy_start ;;
-    *)       die "未知命令: $action" ;;
-  esac
+  PERSIST_CONFIG=1
+  interactive_menu
 }
 
 main "$@"

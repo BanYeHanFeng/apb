@@ -37,7 +37,7 @@ metadata:
 
 ## AI 执行顺序
 
-1. **定位二进制**：优先 `command -v apb`；本仓库用 `target/release/apb`；节点端没有二进制时用 `runApb.sh` 自动下载，不要先装 Rust / sshd。
+1. **定位二进制**：优先 `command -v apb`；本仓库用 `target/release/apb`；节点端没有二进制时运行 `runApb.sh`，在菜单里选 `4` 安装，不要先装 Rust / sshd。
 2. **定位参数**：控制命令需要 `APB_SERVER` 和 `APB_KEY`；优先读环境变量，本机部署按上面的方法加载密钥文件。找不到就问用户，不要猜 IP / key，也不要把 key 打到输出。
 3. **先 `status`**：`apb status --json`，从 `agents[].name` 拿节点名；单个 agent 在线可省略 `--name`，多个 agent 必须指定。
 4. **再执行**：用 `apb exec/push/pull --json ...`；按 JSON 的 `ok` / `rc` 判断结果，不要解析人类可读输出。
@@ -53,18 +53,13 @@ command -v apb || BIN=./target/release/apb
 cargo build --release --locked
 ./target/release/apb --version
 
-# 目标节点一键管理（自动识别 x86_64 / aarch64；无参数进入 1/2/3 数字菜单）
+# 目标节点一键管理（自动识别 x86_64 / aarch64；仅支持无参数数字菜单）
 bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
 # 不支持进程替换的 shell：curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh | bash
-# 菜单：1 启动 / 2 停止 / 3 重启 / 4 更新 / 5 状态 / 6 修改配置 / 0 退出
-# 也可直接执行：bash runApb.sh start|stop|restart|update|status|config
-
-# 非交互 / 只安装 / 前台 / 预发布通道
-# APB_SERVER='IP:30020' APB_KEY="$APB_KEY" APB_NAME=node-a APB_CHANNEL=prerelease \
-#   bash runApb.sh --yes --background
-# bash runApb.sh --install-only
-# bash runApb.sh --foreground
-# 注意：菜单/管理命令会把非密钥配置保存到 ~/.config/apb/agent.conf，APB_KEY 不落盘。
+# 菜单：1 启动 / 2 停止 / 3 重启 / 4 安装 / 5 更新 / 6 状态 / 7 配置 / 0 退出
+# 启动 / 重启只使用已安装二进制，不会自动下载；第一次先在菜单选 4 安装。
+# runApb.sh 不接受任何命令行参数，也不提供非交互模式；自动化请直接调用 `apb agent`。
+# 注意：菜单操作会把非密钥配置保存到 ~/.config/apb/agent.conf，APB_KEY 不落盘。
 ```
 
 静态 musl 构建、CI 与发布说明见 `docs/构建与测试.md`。
@@ -88,8 +83,9 @@ journalctl -u apb-serve -n 50 --no-pager
 ```bash
 # A. Termux / Android：无 root、无 sshd，一条命令打开管理菜单
 bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/apb/main/runApb.sh)
-# 首次选 1 启动：询问通道（1 正式版 / 2 预发布）、APB_SERVER、APB_KEY、节点名、运行方式
-# 之后用 1 启动 / 2 停止 / 3 重启 / 4 更新 / 5 状态 / 6 配置 / 0 退出
+# 首次选 4 安装：询问通道（1 正式版 / 2 预发布版）
+# 再选 1 启动：询问 APB_SERVER、APB_KEY、节点名、运行方式
+# 之后用 1 启动 / 2 停止 / 3 重启 / 4 安装 / 5 更新 / 6 状态 / 7 配置 / 0 退出
 
 # B. 已有 apb 的 Linux / runner：指定 APB_NAME 后启动
 APB_SERVER='IP:30020' APB_KEY="$APB_KEY" APB_NAME='node-a' apb agent

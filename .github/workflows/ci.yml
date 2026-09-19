@@ -50,7 +50,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ github.event.inputs.tag || '' }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message || '' }}
-          # 固定预发布 tag，runApb.sh 的 --pre 也默认从该 tag 下载
+          # 固定预发布 tag，runApb.sh 菜单中的“预发布版”也默认从该 tag 下载
           PRERELEASE_TAG: pre-release
         run: |
           should_publish=false
