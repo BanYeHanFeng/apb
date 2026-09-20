@@ -44,6 +44,11 @@ pub const OP_PUSH_END: u8 = 17;
 pub const OP_TRANSFER_DONE: u8 = 18;
 pub const OP_PULL_BEGIN: u8 = 20;
 pub const OP_ENTRY: u8 = 21;
+// Lifecycle ops: the controller asks an agent to end itself, the agent answers
+// with a final `Bye` and then exits its process.  `Bye.code` is the exit code
+// the agent is about to use, so the controller can report it.
+pub const OP_SHUTDOWN: u8 = 30;
+pub const OP_BYE: u8 = 31;
 
 pub const ENTRY_DIR: u8 = 0;
 pub const ENTRY_FILE: u8 = 1;
@@ -208,6 +213,18 @@ pub enum Payload {
         mode: u32,
         link_target: String,
         sha256: [u8; 32],
+    },
+    /// controller → agent: end the agent process.
+    Shutdown {
+        id: u64,
+        reason: String,
+    },
+    /// agent → controller: the shutdown request was accepted; the agent exits
+    /// with `code` right after this final payload.
+    Bye {
+        id: u64,
+        code: i32,
+        reason: String,
     },
 }
 
@@ -504,7 +521,9 @@ impl Payload {
             | Payload::PushEnd { id, .. }
             | Payload::TransferDone { id, .. }
             | Payload::PullBegin { id, .. }
-            | Payload::Entry { id, .. } => *id,
+            | Payload::Entry { id, .. }
+            | Payload::Shutdown { id, .. }
+            | Payload::Bye { id, .. } => *id,
         }
     }
 
@@ -525,6 +544,8 @@ impl Payload {
             Payload::TransferDone { .. } => OP_TRANSFER_DONE,
             Payload::PullBegin { .. } => OP_PULL_BEGIN,
             Payload::Entry { .. } => OP_ENTRY,
+            Payload::Shutdown { .. } => OP_SHUTDOWN,
+            Payload::Bye { .. } => OP_BYE,
         }
     }
 
@@ -545,7 +566,10 @@ impl Payload {
     pub fn is_final(&self) -> bool {
         matches!(
             self,
-            Payload::ExecEnd { .. } | Payload::Error { .. } | Payload::TransferDone { .. }
+            Payload::ExecEnd { .. }
+                | Payload::Error { .. }
+                | Payload::TransferDone { .. }
+                | Payload::Bye { .. }
         )
     }
 
@@ -674,6 +698,12 @@ impl Payload {
                     .str(link_target)
                     .fixed32(sha256);
             }
+            Payload::Shutdown { id, reason } => {
+                e.u8(OP_SHUTDOWN).u64(*id).str(reason);
+            }
+            Payload::Bye { id, code, reason } => {
+                e.u8(OP_BYE).u64(*id).i32(*code).str(reason);
+            }
         }
         e.finish()
     }
@@ -762,6 +792,15 @@ impl Payload {
                 link_target: d.str()?,
                 sha256: d.fixed32()?,
             },
+            OP_SHUTDOWN => Payload::Shutdown {
+                id: d.u64()?,
+                reason: d.str()?,
+            },
+            OP_BYE => Payload::Bye {
+                id: d.u64()?,
+                code: d.i32()?,
+                reason: d.str()?,
+            },
             other => return err(format!("unknown payload op {}", other)),
         };
         d.finish()?;
@@ -801,6 +840,24 @@ mod tests {
             sha256: [3u8; 32],
         };
         assert_eq!(p, Payload::decode(&p.encode()).unwrap());
+    }
+
+    #[test]
+    fn lifecycle_roundtrip() {
+        let shutdown = Payload::Shutdown {
+            id: 11,
+            reason: "ci done".into(),
+        };
+        assert_eq!(shutdown, Payload::decode(&shutdown.encode()).unwrap());
+        assert!(!shutdown.is_final());
+
+        let bye = Payload::Bye {
+            id: 11,
+            code: 0,
+            reason: "agent ending".into(),
+        };
+        assert_eq!(bye, Payload::decode(&bye.encode()).unwrap());
+        assert!(bye.is_final());
     }
 
     #[test]
