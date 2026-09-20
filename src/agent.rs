@@ -5,13 +5,17 @@
 //! reconnects forever with exponential backoff.  It never writes a config file
 //! and never starts sshd.
 
-use crate::proto::{Frame, Payload, ENTRY_DIR, ENTRY_FILE, ENTRY_SYMLINK, ROLE_AGENT};
+use crate::delta;
+use crate::proto::{
+    Frame, Payload, ENTRY_DIR, ENTRY_FILE, ENTRY_SYMLINK, PLAN_DELTA, PLAN_SEND, PLAN_SKIP,
+    ROLE_AGENT,
+};
 use crate::util::{basename, expand_tilde, mode_of, safe_rel, set_mode};
 use crate::wire::Conn;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -274,13 +278,11 @@ fn spawn_worker(
         Payload::Exec { .. } | Payload::PushBegin { .. } | Payload::PullBegin { .. }
     );
     if !is_start {
-        send_error(
-            &conn,
-            route,
-            id,
-            400,
-            "payload continuation has no active route",
-        );
+        // The route is gone: its worker already sent the final payload or was
+        // cancelled.  Answering every stray continuation frame would flood the
+        // controller's queue while it is still streaming and can deadlock both
+        // sides, so drop it without a word (the route's outcome is already on
+        // the wire).
         return;
     }
     let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::sync_channel(128);
@@ -390,7 +392,7 @@ fn dispatch(
             cancel,
         ),
         Payload::PushBegin { .. } => run_push(conn, route, initial, rx, cancel),
-        Payload::PullBegin { .. } => run_pull(conn, route, initial, cancel),
+        Payload::PullBegin { .. } => run_pull(conn, route, initial, rx, cancel),
         other => {
             send_error(&conn, route, other.id(), 400, "unsupported job");
             Ok(())
@@ -634,17 +636,111 @@ fn spawn_pump<R: Read + Send + 'static>(
             let _ = done.send(());
         });
 }
+// --------------------------------------------------------------- transfers
+//
+// `push` (controller → agent) and `pull` (agent → controller) run in the same
+// three phases, and each phase is strictly one-directional so a bulk payload
+// can never deadlock against a reply that travels the other way:
+//
+//   1. manifest  the sender lists every entry (metadata + content hash)
+//   2. plans     the receiver answers per file: skip, whole file, or delta
+//                together with the block signatures of its local copy
+//   3. data      the sender emits FileStart + Copy/Data + FileEnd
+//
+// An unchanged file therefore costs zero data frames, and a file with a small
+// change only costs the blocks that really differ.
 
-#[derive(Debug)]
-struct PushFile {
-    tmp: PathBuf,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    Send,
+    Skip,
+    Delta,
+}
+
+impl Plan {
+    fn action(self) -> u8 {
+        match self {
+            Plan::Send => PLAN_SEND,
+            Plan::Skip => PLAN_SKIP,
+            Plan::Delta => PLAN_DELTA,
+        }
+    }
+
+    fn from_action(action: u8) -> Result<Plan, String> {
+        match action {
+            PLAN_SEND => Ok(Plan::Send),
+            PLAN_SKIP => Ok(Plan::Skip),
+            PLAN_DELTA => Ok(Plan::Delta),
+            other => Err(format!("unknown file plan action {other}")),
+        }
+    }
+}
+
+/// One file the controller wants on this node (`push`).
+struct PushTarget {
+    seq: u64,
     dest: PathBuf,
-    file: File,
-    hasher: Sha256,
-    expected_size: u64,
-    received: u64,
-    expected_sha: [u8; 32],
+    size: u64,
     mode: u32,
+    sha: [u8; 32],
+    plan: Plan,
+    block_size: u32,
+    block_count: u64,
+}
+
+/// One file this node sends to the controller (`pull`).
+struct PullSource {
+    seq: u64,
+    path: PathBuf,
+    size: u64,
+    sha: [u8; 32],
+    plan: Plan,
+    block_size: u32,
+    block_count: u64,
+    sigs: Vec<u8>,
+}
+
+/// Wait for the next payload of this job.  `Ok(None)` means the job was
+/// cancelled or the route is gone, and the worker should stop quietly.
+fn next_payload(rx: &Receiver<Vec<u8>>, cancel: &AtomicBool) -> io::Result<Option<Payload>> {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(raw) => {
+                return Payload::decode(&raw).map(Some).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("bad payload: {e}"))
+                })
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
+fn tmp_path(dest: &Path, id: u64, seq: u64) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+    dest.with_file_name(format!(".{name}.apb-{id}-{seq}.tmp"))
+}
+
+fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
+    let mut f = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hasher.finalize());
+    Ok(out)
 }
 
 fn run_push(
@@ -679,30 +775,13 @@ fn run_push(
             remote_root: root.to_string_lossy().to_string(),
         },
     );
-    let mut current: Option<PushFile> = None;
-    let mut total_bytes: u64 = 0;
-    let mut file_index: u64 = 0;
 
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            abort_push(&mut current);
-            return Ok(());
-        }
-        let raw = match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(v) => v,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => {
-                abort_push(&mut current);
-                return Ok(());
-            }
-        };
-        let p = match Payload::decode(&raw) {
-            Ok(p) => p,
-            Err(e) => {
-                abort_push(&mut current);
-                send_error(&conn, route, id, 400, format!("bad push payload: {e}"));
-                return Ok(());
-            }
+    // ---- phase 1: manifest ------------------------------------------------
+    let mut targets: Vec<PushTarget> = Vec::new();
+    let declared: u64 = loop {
+        let p = match next_payload(&rx, &cancel)? {
+            Some(p) => p,
+            None => return Ok(()),
         };
         if p.id() != id {
             continue;
@@ -712,20 +791,12 @@ fn run_push(
                 let dir = match join_rel(&root, &rel) {
                     Ok(p) => p,
                     Err(e) => {
-                        abort_push(&mut current);
                         send_error(&conn, route, id, 400, e);
                         return Ok(());
                     }
                 };
                 if let Err(e) = fs::create_dir_all(&dir) {
-                    abort_push(&mut current);
-                    send_error(
-                        &conn,
-                        route,
-                        id,
-                        500,
-                        format!("mkdir {}: {e}", dir.display()),
-                    );
+                    send_error(&conn, route, id, 500, format!("mkdir {}: {e}", dir.display()));
                     return Ok(());
                 }
                 let _ = set_mode(&dir, mode);
@@ -734,7 +805,6 @@ fn run_push(
                 let path = match join_rel(&root, &rel) {
                     Ok(p) => p,
                     Err(e) => {
-                        abort_push(&mut current);
                         send_error(&conn, route, id, 400, e);
                         return Ok(());
                     }
@@ -746,7 +816,6 @@ fn run_push(
                 #[cfg(unix)]
                 {
                     if let Err(e) = std::os::unix::fs::symlink(&target, &path) {
-                        abort_push(&mut current);
                         send_error(
                             &conn,
                             route,
@@ -759,17 +828,13 @@ fn run_push(
                 }
             }
             Payload::FileBegin {
+                seq,
                 rel,
                 size,
                 mode,
                 sha256,
                 ..
             } => {
-                if current.is_some() {
-                    abort_push(&mut current);
-                    send_error(&conn, route, id, 400, "FileBegin before previous FileEnd");
-                    return Ok(());
-                }
                 let dest = match join_rel(&root, &rel) {
                     Ok(p) => p,
                     Err(e) => {
@@ -787,88 +852,195 @@ fn run_push(
                     );
                     return Ok(());
                 }
-                if let Some(parent) = dest.parent() {
-                    if let Err(e) = fs::create_dir_all(parent) {
+                if seq != targets.len() as u64 {
+                    send_error(
+                        &conn,
+                        route,
+                        id,
+                        400,
+                        format!("file seq {seq} is out of order"),
+                    );
+                    return Ok(());
+                }
+                targets.push(PushTarget {
+                    seq,
+                    dest,
+                    size,
+                    mode,
+                    sha: sha256,
+                    plan: Plan::Send,
+                    block_size: 0,
+                    block_count: 0,
+                });
+            }
+            Payload::ManifestEnd { files, .. } => break files,
+            Payload::Error { .. } => return Ok(()),
+            _ => {}
+        }
+    };
+    if declared != targets.len() as u64 {
+        send_error(
+            &conn,
+            route,
+            id,
+            400,
+            format!(
+                "manifest declared {declared} files but listed {}",
+                targets.len()
+            ),
+        );
+        return Ok(());
+    }
+
+    // ---- phase 2: plans ---------------------------------------------------
+    for t in targets.iter_mut() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let sigs = match plan_push_target(t) {
+            Ok(s) => s,
+            Err(e) => {
+                send_error(&conn, route, id, 500, e.to_string());
+                return Ok(());
+            }
+        };
+        let plan = Payload::FilePlan {
+            id,
+            seq: t.seq,
+            action: t.plan.action(),
+            block_size: t.block_size,
+            block_count: t.block_count,
+        };
+        if send_payload(&conn, route, plan).is_err() {
+            return Ok(());
+        }
+        if let Some(set) = sigs {
+            let blob = set.encode();
+            for (i, chunk) in blob.chunks(delta::SIG_BATCH).enumerate() {
+                let frame = Payload::FileSigs {
+                    id,
+                    seq: t.seq,
+                    first: (i * delta::SIGS_PER_FRAME) as u64,
+                    sigs: chunk.to_vec(),
+                };
+                if send_payload(&conn, route, frame).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let _ = send_payload(&conn, route, Payload::PlanEnd { id });
+
+    // ---- phase 3: data ----------------------------------------------------
+    let total: u64 = targets.iter().map(|t| t.size).sum();
+    let mut current: Option<(usize, delta::FileWriter)> = None;
+    loop {
+        let p = match next_payload(&rx, &cancel) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                if let Some((_, w)) = current.take() {
+                    w.abort();
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                if let Some((_, w)) = current.take() {
+                    w.abort();
+                }
+                return Err(e);
+            }
+        };
+        if p.id() != id {
+            continue;
+        }
+        match p {
+            Payload::FileStart { seq, .. } => {
+                let idx = match usize::try_from(seq).ok().filter(|i| *i < targets.len()) {
+                    Some(i) if targets[i].seq == seq => i,
+                    _ => {
+                        if let Some((_, w)) = current.take() {
+                            w.abort();
+                        }
                         send_error(
                             &conn,
                             route,
                             id,
-                            500,
-                            format!("mkdir {}: {e}", parent.display()),
+                            400,
+                            format!("FileStart for unknown seq {seq}"),
                         );
                         return Ok(());
                     }
+                };
+                if current.is_some() {
+                    if let Some((_, w)) = current.take() {
+                        w.abort();
+                    }
+                    send_error(&conn, route, id, 400, "FileStart before FileEnd");
+                    return Ok(());
                 }
-                let file_name = dest
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "file".into());
-                let tmp = dest.with_file_name(format!(".{file_name}.apb-{id}-{file_index}.tmp"));
-                file_index += 1;
-                let f = match OpenOptions::new().write(true).create_new(true).open(&tmp) {
-                    Ok(f) => f,
+                let t = &targets[idx];
+                let base = if t.plan == Plan::Delta {
+                    Some(t.dest.as_path())
+                } else {
+                    None
+                };
+                match delta::FileWriter::create(&t.dest, base, tmp_path(&t.dest, id, seq), t.size) {
+                    Ok(w) => current = Some((idx, w)),
                     Err(e) => {
                         send_error(
                             &conn,
                             route,
                             id,
                             500,
-                            format!("create {}: {e}", tmp.display()),
+                            format!("create {}: {e}", t.dest.display()),
                         );
                         return Ok(());
                     }
-                };
-                current = Some(PushFile {
-                    tmp,
-                    dest,
-                    file: f,
-                    hasher: Sha256::new(),
-                    expected_size: size,
-                    received: 0,
-                    expected_sha: sha256,
-                    mode,
-                });
+                }
             }
             Payload::Data { data, .. } => {
-                let mut failure: Option<String> = None;
-                if let Some(cur) = current.as_mut() {
-                    if cur.received + data.len() as u64 > cur.expected_size {
-                        failure = Some("received more bytes than expected".into());
-                    } else {
-                        cur.hasher.update(&data);
-                        if let Err(e) = cur.file.write_all(&data) {
-                            failure = Some(format!("write {}: {e}", cur.tmp.display()));
-                        } else {
-                            cur.received += data.len() as u64;
-                        }
-                    }
-                } else {
-                    failure = Some("Data without FileBegin".into());
-                }
-                if let Some(e) = failure {
-                    abort_push(&mut current);
-                    send_error(&conn, route, id, 500, e);
+                let Some((_, w)) = current.as_mut() else {
+                    send_error(&conn, route, id, 400, "Data without FileStart");
+                    return Ok(());
+                };
+                if let Err(e) = w.write_literal(&data) {
+                    let msg = e.to_string();
+                    current.take().unwrap().1.abort();
+                    send_error(&conn, route, id, 500, msg);
                     return Ok(());
                 }
             }
-            Payload::FileEnd { .. } => {
-                let cur = match current.take() {
-                    Some(c) => c,
-                    None => {
-                        send_error(&conn, route, id, 400, "FileEnd without FileBegin");
-                        return Ok(());
-                    }
+            Payload::Copy { start, len, .. } => {
+                let Some((_, w)) = current.as_mut() else {
+                    send_error(&conn, route, id, 400, "Copy without FileStart");
+                    return Ok(());
                 };
-                let size = cur.expected_size;
-                if let Err(e) = finalize_push_file(cur) {
+                if let Err(e) = w.copy_from_base(start, len) {
+                    let msg = e.to_string();
+                    current.take().unwrap().1.abort();
+                    send_error(&conn, route, id, 500, msg);
+                    return Ok(());
+                }
+            }
+            Payload::FileEnd { sha256, .. } => {
+                let Some((idx, w)) = current.take() else {
+                    send_error(&conn, route, id, 400, "FileEnd without FileStart");
+                    return Ok(());
+                };
+                if sha256 == [0u8; 32] {
+                    w.abort();
+                    send_error(&conn, route, id, 400, "FileEnd without a content hash");
+                    return Ok(());
+                }
+                let mode = targets[idx].mode;
+                if let Err(e) = w.finish(&sha256, mode) {
                     send_error(&conn, route, id, 500, e);
                     return Ok(());
                 }
-                total_bytes += size;
             }
             Payload::PushEnd { .. } => {
-                if current.is_some() {
-                    abort_push(&mut current);
+                if let Some((_, w)) = current.take() {
+                    w.abort();
                     send_error(&conn, route, id, 400, "PushEnd before FileEnd");
                     return Ok(());
                 }
@@ -880,14 +1052,16 @@ fn run_push(
                         ok: true,
                         error: String::new(),
                         remote_path: root.to_string_lossy().to_string(),
-                        bytes: total_bytes,
+                        bytes: total,
                         sha256: [0u8; 32],
                     },
                 );
                 return Ok(());
             }
             Payload::Error { .. } => {
-                abort_push(&mut current);
+                if let Some((_, w)) = current.take() {
+                    w.abort();
+                }
                 return Ok(());
             }
             _ => {}
@@ -895,39 +1069,36 @@ fn run_push(
     }
 }
 
-fn abort_push(current: &mut Option<PushFile>) {
-    if let Some(c) = current.take() {
-        let _ = fs::remove_file(&c.tmp);
+/// Decide how the controller has to deliver one file and, for a delta, return
+/// the block signatures of the local copy (computed in the same pass that
+/// hashes it).
+fn plan_push_target(t: &mut PushTarget) -> io::Result<Option<delta::SigSet>> {
+    t.plan = Plan::Send;
+    t.block_size = 0;
+    t.block_count = 0;
+    let meta = match fs::symlink_metadata(&t.dest) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    if !meta.is_file() {
+        return Ok(None);
     }
-}
-
-fn finalize_push_file(cur: PushFile) -> Result<(), String> {
-    if cur.received != cur.expected_size {
-        let _ = fs::remove_file(&cur.tmp);
-        return Err(format!(
-            "size mismatch for {}: expected {}, got {}",
-            cur.dest.display(),
-            cur.expected_size,
-            cur.received
-        ));
+    let base_size = meta.len();
+    let set = delta::SigSet::scan(&t.dest, delta::choose_block_size(base_size))?;
+    if t.sha != [0u8; 32] && set.file_sha == t.sha {
+        // Content is identical: no data crosses the wire, but permissions are
+        // metadata the source owns and must still be applied.
+        let _ = set_mode(&t.dest, t.mode);
+        t.plan = Plan::Skip;
+        return Ok(None);
     }
-    let got = cur.hasher.finalize();
-    if cur.expected_sha != [0u8; 32] {
-        let mut g = [0u8; 32];
-        g.copy_from_slice(&got);
-        if g != cur.expected_sha {
-            let _ = fs::remove_file(&cur.tmp);
-            return Err(format!("sha256 mismatch for {}", cur.dest.display()));
-        }
+    if !delta::worth_delta(base_size, t.size, set.block_count) {
+        return Ok(None);
     }
-    cur.file
-        .sync_all()
-        .map_err(|e| format!("sync {}: {e}", cur.tmp.display()))?;
-    drop(cur.file);
-    fs::rename(&cur.tmp, &cur.dest)
-        .map_err(|e| format!("rename to {}: {e}", cur.dest.display()))?;
-    let _ = set_mode(&cur.dest, cur.mode);
-    Ok(())
+    t.plan = Plan::Delta;
+    t.block_size = set.block_size;
+    t.block_count = set.block_count;
+    Ok(Some(set))
 }
 
 fn resolve_push_root(
@@ -940,25 +1111,31 @@ fn resolve_push_root(
     let p = Path::new(&expanded);
     let exists = p.exists();
     let is_dir = exists && p.is_dir();
+    if source_is_dir {
+        if exists && !is_dir {
+            return Err(format!(
+                "cannot push directory onto existing file: {}",
+                p.display()
+            ));
+        }
+        // A directory always keeps its own name inside the remote path, whether
+        // or not that path already exists (rsync semantics).  Resolving it any
+        // other way would move the destination between two identical pushes and
+        // throw away everything the delta transfer could reuse.
+        let root = p.join(source_name);
+        fs::create_dir_all(&root).map_err(|e| format!("mkdir {}: {e}", root.display()))?;
+        return Ok(root);
+    }
     let root = if is_dir || trailing {
         p.join(source_name)
-    } else if exists && source_is_dir {
-        return Err(format!(
-            "cannot push directory onto existing file: {}",
-            p.display()
-        ));
     } else {
         p.to_path_buf()
     };
-    if source_is_dir {
-        fs::create_dir_all(&root).map_err(|e| format!("mkdir {}: {e}", root.display()))?;
-    } else {
-        if root.is_dir() {
-            return Err(format!("target is a directory: {}", root.display()));
-        }
-        if let Some(parent) = root.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-        }
+    if root.is_dir() {
+        return Err(format!("target is a directory: {}", root.display()));
+    }
+    if let Some(parent) = root.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     Ok(root)
 }
@@ -975,6 +1152,7 @@ fn run_pull(
     conn: Arc<Conn>,
     route: u64,
     initial: Payload,
+    rx: Receiver<Vec<u8>>,
     cancel: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let (id, remote_path) = match initial {
@@ -997,8 +1175,10 @@ fn run_pull(
         }
     };
     let root_name = basename(&expanded);
-    let mut bytes: u64 = 0;
-    let res = if meta.file_type().is_symlink() {
+
+    // ---- phase 1: manifest ------------------------------------------------
+    let mut sources: Vec<PullSource> = Vec::new();
+    let result = if meta.file_type().is_symlink() {
         let target = fs::read_link(root)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -1006,6 +1186,7 @@ fn run_pull(
             &conn,
             route,
             id,
+            0,
             &root_name,
             ENTRY_SYMLINK,
             0,
@@ -1014,68 +1195,212 @@ fn run_pull(
             [0u8; 32],
         )
     } else if meta.is_file() {
+        let sha = hash_file(root)?;
+        sources.push(PullSource {
+            seq: 0,
+            path: root.to_path_buf(),
+            size: meta.len(),
+            sha,
+            plan: Plan::Send,
+            block_size: 0,
+            block_count: 0,
+            sigs: Vec::new(),
+        });
         send_entry(
             &conn,
             route,
             id,
+            0,
             &root_name,
             ENTRY_FILE,
             meta.len(),
             mode_of(&meta),
             "",
-            [0u8; 32],
-        )?;
-        bytes += stream_file(&conn, route, id, root, &cancel)?;
-        Ok(())
+            sha,
+        )
     } else if meta.is_dir() {
         send_entry(
             &conn,
             route,
             id,
+            0,
             &root_name,
             ENTRY_DIR,
             0,
             mode_of(&meta),
             "",
             [0u8; 32],
-        )?;
-        walk_pull(&conn, route, id, root, &root_name, &mut bytes, &cancel)
+        )
+        .and_then(|()| walk_pull(&conn, route, id, root, &root_name, &mut sources, &cancel))
     } else {
         Err(io::Error::new(
             io::ErrorKind::Other,
             "unsupported special file",
         ))
     };
-    match res {
-        Ok(()) => {
-            let _ = send_payload(
-                &conn,
-                route,
-                Payload::TransferDone {
-                    id,
-                    ok: true,
-                    error: String::new(),
-                    remote_path: root.to_string_lossy().to_string(),
-                    bytes,
-                    sha256: [0u8; 32],
-                },
-            );
+    if let Err(e) = result {
+        let _ = send_payload(
+            &conn,
+            route,
+            Payload::TransferDone {
+                id,
+                ok: false,
+                error: e.to_string(),
+                remote_path: root.to_string_lossy().to_string(),
+                bytes: 0,
+                sha256: [0u8; 32],
+            },
+        );
+        return Ok(());
+    }
+    let total: u64 = sources.iter().map(|s| s.size).sum();
+    let _ = send_payload(
+        &conn,
+        route,
+        Payload::ManifestEnd {
+            id,
+            files: sources.len() as u64,
+        },
+    );
+
+    // ---- phase 2: plans ---------------------------------------------------
+    let mut planned = false;
+    while !planned {
+        let p = match next_payload(&rx, &cancel)? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if p.id() != id {
+            continue;
         }
-        Err(e) => {
-            let _ = send_payload(
-                &conn,
-                route,
-                Payload::TransferDone {
-                    id,
-                    ok: false,
-                    error: e.to_string(),
-                    remote_path: root.to_string_lossy().to_string(),
-                    bytes,
-                    sha256: [0u8; 32],
+        let step = match p {
+            Payload::FilePlan {
+                seq,
+                action,
+                block_size,
+                block_count,
+                ..
+            } => match sources.get_mut(seq as usize) {
+                Some(s) if s.seq == seq => match Plan::from_action(action) {
+                    Ok(plan) => {
+                        s.plan = plan;
+                        s.block_size = block_size;
+                        s.block_count = block_count;
+                        s.sigs.clear();
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
                 },
-            );
+                _ => Err(format!("plan for unknown file seq {seq}")),
+            },
+            Payload::FileSigs {
+                seq, first, sigs, ..
+            } => match sources.get_mut(seq as usize) {
+                Some(s) if s.seq == seq => {
+                    let at = usize::try_from(first)
+                        .ok()
+                        .and_then(|n| n.checked_mul(delta::SIG_LEN));
+                    match at {
+                        Some(at) if s.sigs.len() == at => {
+                            s.sigs.extend_from_slice(&sigs);
+                            Ok(())
+                        }
+                        _ => Err(format!("signature frame out of order for file seq {seq}")),
+                    }
+                }
+                _ => Err(format!("signatures for unknown file seq {seq}")),
+            },
+            Payload::PlanEnd { .. } => {
+                planned = true;
+                Ok(())
+            }
+            Payload::Error { .. } => return Ok(()),
+            _ => Ok(()),
+        };
+        if let Err(e) = step {
+            send_error(&conn, route, id, 400, e);
+            return Ok(());
         }
     }
+
+    // ---- phase 3: data ----------------------------------------------------
+    for s in sources.iter() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if s.plan == Plan::Skip {
+            continue;
+        }
+        if send_payload(&conn, route, Payload::FileStart { id, seq: s.seq }).is_err() {
+            return Ok(());
+        }
+        match s.plan {
+            Plan::Send => {
+                if let Err(e) = stream_file(&conn, route, id, &s.path, &cancel) {
+                    return finish_pull(&conn, route, id, root, total, Err(e));
+                }
+            }
+            Plan::Delta => {
+                let idx = match delta::SigIndex::new(s.block_size, s.block_count, &s.sigs) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        send_error(&conn, route, id, 400, e);
+                        return Ok(());
+                    }
+                };
+                let mut f = File::open(&s.path)?;
+                let mut emit = |op: delta::Op| -> io::Result<()> {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                    }
+                    let p = match op {
+                        delta::Op::Copy { start, len } => Payload::Copy { id, start, len },
+                        delta::Op::Data(data) => Payload::Data { id, data },
+                    };
+                    send_payload(&conn, route, p)
+                        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))
+                };
+                if let Err(e) = delta::produce_delta(&mut f, &idx, &mut emit) {
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        return Ok(());
+                    }
+                    return finish_pull(&conn, route, id, root, total, Err(e));
+                }
+            }
+            Plan::Skip => {}
+        }
+        let frame = Payload::FileEnd { id, sha256: s.sha };
+        if send_payload(&conn, route, frame).is_err() {
+            return Ok(());
+        }
+    }
+    finish_pull(&conn, route, id, root, total, Ok(()))
+}
+
+fn finish_pull(
+    conn: &Conn,
+    route: u64,
+    id: u64,
+    root: &Path,
+    total: u64,
+    result: io::Result<()>,
+) -> io::Result<()> {
+    let (ok, error) = match result {
+        Ok(()) => (true, String::new()),
+        Err(e) => (false, e.to_string()),
+    };
+    let _ = send_payload(
+        conn,
+        route,
+        Payload::TransferDone {
+            id,
+            ok,
+            error,
+            remote_path: root.to_string_lossy().to_string(),
+            bytes: total,
+            sha256: [0u8; 32],
+        },
+    );
     Ok(())
 }
 
@@ -1085,7 +1410,7 @@ fn walk_pull(
     id: u64,
     dir: &Path,
     rel_prefix: &str,
-    bytes: &mut u64,
+    sources: &mut Vec<PullSource>,
     cancel: &AtomicBool,
 ) -> io::Result<()> {
     let mut entries: Vec<PathBuf> = Vec::new();
@@ -1111,6 +1436,7 @@ fn walk_pull(
                 conn,
                 route,
                 id,
+                0,
                 &rel,
                 ENTRY_SYMLINK,
                 0,
@@ -1123,6 +1449,7 @@ fn walk_pull(
                 conn,
                 route,
                 id,
+                0,
                 &rel,
                 ENTRY_DIR,
                 0,
@@ -1130,20 +1457,34 @@ fn walk_pull(
                 "",
                 [0u8; 32],
             )?;
-            walk_pull(conn, route, id, &p, &rel, bytes, cancel)?;
+            walk_pull(conn, route, id, &p, &rel, sources, cancel)?;
         } else if meta.is_file() {
+            // The hash is what lets the controller skip an identical local file
+            // and what verifies the rebuilt file afterwards.
+            let sha = hash_file(&p)?;
+            let seq = sources.len() as u64;
+            sources.push(PullSource {
+                seq,
+                path: p.clone(),
+                size: meta.len(),
+                sha,
+                plan: Plan::Send,
+                block_size: 0,
+                block_count: 0,
+                sigs: Vec::new(),
+            });
             send_entry(
                 conn,
                 route,
                 id,
+                seq,
                 &rel,
                 ENTRY_FILE,
                 meta.len(),
                 mode_of(&meta),
                 "",
-                [0u8; 32],
+                sha,
             )?;
-            *bytes += stream_file(conn, route, id, &p, cancel)?;
         }
     }
     Ok(())
@@ -1154,6 +1495,7 @@ fn send_entry(
     conn: &Conn,
     route: u64,
     id: u64,
+    seq: u64,
     rel: &str,
     kind: u8,
     size: u64,
@@ -1166,6 +1508,7 @@ fn send_entry(
         route,
         Payload::Entry {
             id,
+            seq,
             rel: rel.to_string(),
             kind,
             size,

@@ -37,6 +37,8 @@ exec options:\n\
   --timeout SECONDS --cwd DIR --max-output BYTES\n\
 push/pull options:\n\
   --server A --key K --name AGENT --json\n\
+  push and pull only move changed data: a file whose content matches on the\n\
+  other side costs nothing, a changed file is sent as a block delta.\n\
 stop options:\n\
   --server A --key K --name AGENT --json --reason TEXT --timeout SECONDS\n\
   stop ends the agent process (rc 0), which is what makes a CI step that runs\n\

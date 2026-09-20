@@ -1,4 +1,4 @@
-//! Wire messages for the APB0 relay protocol (apb 0.1.0).
+//! Wire messages for the APB0 relay protocol (apb 0.2.0).
 //!
 //! Every TCP connection runs a Noise handshake first.  After that, each
 //! encrypted Noise message carries exactly one `Frame` (control-plane) or one
@@ -42,8 +42,24 @@ pub const OP_FILE_END: u8 = 15;
 pub const OP_SYMLINK: u8 = 16;
 pub const OP_PUSH_END: u8 = 17;
 pub const OP_TRANSFER_DONE: u8 = 18;
+pub const OP_MANIFEST_END: u8 = 19;
 pub const OP_PULL_BEGIN: u8 = 20;
 pub const OP_ENTRY: u8 = 21;
+pub const OP_FILE_PLAN: u8 = 22;
+pub const OP_FILE_SIGS: u8 = 23;
+pub const OP_COPY: u8 = 24;
+pub const OP_FILE_START: u8 = 25;
+pub const OP_PLAN_END: u8 = 26;
+
+/// `FilePlan.action`: the receiver has no usable local base, the sender streams
+/// the whole file as `Data` frames.
+pub const PLAN_SEND: u8 = 0;
+/// `FilePlan.action`: the receiver already holds byte-identical content, so the
+/// file costs zero data frames.
+pub const PLAN_SKIP: u8 = 1;
+/// `FilePlan.action`: the receiver holds a related file and sent its block
+/// signatures (`FileSigs`), so the sender only has to send the difference.
+pub const PLAN_DELTA: u8 = 2;
 // Lifecycle ops: the controller asks an agent to end itself, the agent answers
 // with a final `Bye` and then exits its process.  `Bye.code` is the exit code
 // the agent is about to use, so the controller can report it.
@@ -170,19 +186,27 @@ pub enum Payload {
         rel: String,
         mode: u32,
     },
+    /// Metadata only: `seq` is the index of this file among the files of the
+    /// manifest.  No data follows until the receiver answered with a
+    /// `FilePlan` for `seq`.
     FileBegin {
         id: u64,
+        seq: u64,
         rel: String,
         size: u64,
         mode: u32,
         sha256: [u8; 32],
     },
+    /// Literal bytes of the file currently opened by `FileStart`.
     Data {
         id: u64,
         data: Vec<u8>,
     },
+    /// End of the file opened by `FileStart`; `sha256` is the content hash the
+    /// receiver must see after rebuilding the file (zeros = no verification).
     FileEnd {
         id: u64,
+        sha256: [u8; 32],
     },
     Symlink {
         id: u64,
@@ -201,18 +225,59 @@ pub enum Payload {
         bytes: u64,
         sha256: [u8; 32],
     },
+    /// End of the manifest (`Mkdir` / `Symlink` / `FileBegin` frames).  The
+    /// receiver answers with one `FilePlan` per file and then `PlanEnd`.
+    ManifestEnd {
+        id: u64,
+        files: u64,
+    },
     PullBegin {
         id: u64,
         remote_path: String,
     },
     Entry {
         id: u64,
+        seq: u64,
         rel: String,
         kind: u8,
         size: u64,
         mode: u32,
         link_target: String,
         sha256: [u8; 32],
+    },
+    /// receiver → sender: how the sender must deliver file `seq`.
+    /// `block_size` / `block_count` are only meaningful for `PLAN_DELTA`.
+    FilePlan {
+        id: u64,
+        seq: u64,
+        action: u8,
+        block_size: u32,
+        block_count: u64,
+    },
+    /// receiver → sender: `sigs` carries `(u32 weak, 16-byte strong)` pairs
+    /// starting at block index `first`; one file may need several frames.
+    FileSigs {
+        id: u64,
+        seq: u64,
+        first: u64,
+        sigs: Vec<u8>,
+    },
+    /// receiver → sender: every file has a plan now, the data phase starts.
+    PlanEnd {
+        id: u64,
+    },
+    /// sender → receiver: start writing file `seq`.  Older content of that file
+    /// is the base for the `Copy` frames that may follow.
+    FileStart {
+        id: u64,
+        seq: u64,
+    },
+    /// sender → receiver: reuse `len` bytes of the base file starting at
+    /// `start` instead of sending them again.
+    Copy {
+        id: u64,
+        start: u64,
+        len: u64,
     },
     /// controller → agent: end the agent process.
     Shutdown {
@@ -520,8 +585,14 @@ impl Payload {
             | Payload::Symlink { id, .. }
             | Payload::PushEnd { id, .. }
             | Payload::TransferDone { id, .. }
+            | Payload::ManifestEnd { id, .. }
             | Payload::PullBegin { id, .. }
             | Payload::Entry { id, .. }
+            | Payload::FilePlan { id, .. }
+            | Payload::FileSigs { id, .. }
+            | Payload::PlanEnd { id, .. }
+            | Payload::FileStart { id, .. }
+            | Payload::Copy { id, .. }
             | Payload::Shutdown { id, .. }
             | Payload::Bye { id, .. } => *id,
         }
@@ -542,8 +613,14 @@ impl Payload {
             Payload::Symlink { .. } => OP_SYMLINK,
             Payload::PushEnd { .. } => OP_PUSH_END,
             Payload::TransferDone { .. } => OP_TRANSFER_DONE,
+            Payload::ManifestEnd { .. } => OP_MANIFEST_END,
             Payload::PullBegin { .. } => OP_PULL_BEGIN,
             Payload::Entry { .. } => OP_ENTRY,
+            Payload::FilePlan { .. } => OP_FILE_PLAN,
+            Payload::FileSigs { .. } => OP_FILE_SIGS,
+            Payload::PlanEnd { .. } => OP_PLAN_END,
+            Payload::FileStart { .. } => OP_FILE_START,
+            Payload::Copy { .. } => OP_COPY,
             Payload::Shutdown { .. } => OP_SHUTDOWN,
             Payload::Bye { .. } => OP_BYE,
         }
@@ -632,6 +709,7 @@ impl Payload {
             }
             Payload::FileBegin {
                 id,
+                seq,
                 rel,
                 size,
                 mode,
@@ -639,6 +717,7 @@ impl Payload {
             } => {
                 e.u8(OP_FILE_BEGIN)
                     .u64(*id)
+                    .u64(*seq)
                     .str(rel)
                     .u64(*size)
                     .u32(*mode)
@@ -647,8 +726,8 @@ impl Payload {
             Payload::Data { id, data } => {
                 e.u8(OP_DATA).u64(*id).bytes(data);
             }
-            Payload::FileEnd { id } => {
-                e.u8(OP_FILE_END).u64(*id);
+            Payload::FileEnd { id, sha256 } => {
+                e.u8(OP_FILE_END).u64(*id).fixed32(sha256);
             }
             Payload::Symlink {
                 id,
@@ -677,11 +756,15 @@ impl Payload {
                     .u64(*bytes)
                     .fixed32(sha256);
             }
+            Payload::ManifestEnd { id, files } => {
+                e.u8(OP_MANIFEST_END).u64(*id).u64(*files);
+            }
             Payload::PullBegin { id, remote_path } => {
                 e.u8(OP_PULL_BEGIN).u64(*id).str(remote_path);
             }
             Payload::Entry {
                 id,
+                seq,
                 rel,
                 kind,
                 size,
@@ -691,12 +774,48 @@ impl Payload {
             } => {
                 e.u8(OP_ENTRY)
                     .u64(*id)
+                    .u64(*seq)
                     .str(rel)
                     .u8(*kind)
                     .u64(*size)
                     .u32(*mode)
                     .str(link_target)
                     .fixed32(sha256);
+            }
+            Payload::FilePlan {
+                id,
+                seq,
+                action,
+                block_size,
+                block_count,
+            } => {
+                e.u8(OP_FILE_PLAN)
+                    .u64(*id)
+                    .u64(*seq)
+                    .u8(*action)
+                    .u32(*block_size)
+                    .u64(*block_count);
+            }
+            Payload::FileSigs {
+                id,
+                seq,
+                first,
+                sigs,
+            } => {
+                e.u8(OP_FILE_SIGS)
+                    .u64(*id)
+                    .u64(*seq)
+                    .u64(*first)
+                    .bytes(sigs);
+            }
+            Payload::PlanEnd { id } => {
+                e.u8(OP_PLAN_END).u64(*id);
+            }
+            Payload::FileStart { id, seq } => {
+                e.u8(OP_FILE_START).u64(*id).u64(*seq);
+            }
+            Payload::Copy { id, start, len } => {
+                e.u8(OP_COPY).u64(*id).u64(*start).u64(*len);
             }
             Payload::Shutdown { id, reason } => {
                 e.u8(OP_SHUTDOWN).u64(*id).str(reason);
@@ -754,6 +873,7 @@ impl Payload {
             },
             OP_FILE_BEGIN => Payload::FileBegin {
                 id: d.u64()?,
+                seq: d.u64()?,
                 rel: d.str()?,
                 size: d.u64()?,
                 mode: d.u32()?,
@@ -763,7 +883,10 @@ impl Payload {
                 id: d.u64()?,
                 data: d.bytes()?,
             },
-            OP_FILE_END => Payload::FileEnd { id: d.u64()? },
+            OP_FILE_END => Payload::FileEnd {
+                id: d.u64()?,
+                sha256: d.fixed32()?,
+            },
             OP_SYMLINK => Payload::Symlink {
                 id: d.u64()?,
                 rel: d.str()?,
@@ -779,18 +902,46 @@ impl Payload {
                 bytes: d.u64()?,
                 sha256: d.fixed32()?,
             },
+            OP_MANIFEST_END => Payload::ManifestEnd {
+                id: d.u64()?,
+                files: d.u64()?,
+            },
             OP_PULL_BEGIN => Payload::PullBegin {
                 id: d.u64()?,
                 remote_path: d.str()?,
             },
             OP_ENTRY => Payload::Entry {
                 id: d.u64()?,
+                seq: d.u64()?,
                 rel: d.str()?,
                 kind: d.u8()?,
                 size: d.u64()?,
                 mode: d.u32()?,
                 link_target: d.str()?,
                 sha256: d.fixed32()?,
+            },
+            OP_FILE_PLAN => Payload::FilePlan {
+                id: d.u64()?,
+                seq: d.u64()?,
+                action: d.u8()?,
+                block_size: d.u32()?,
+                block_count: d.u64()?,
+            },
+            OP_FILE_SIGS => Payload::FileSigs {
+                id: d.u64()?,
+                seq: d.u64()?,
+                first: d.u64()?,
+                sigs: d.bytes()?,
+            },
+            OP_PLAN_END => Payload::PlanEnd { id: d.u64()? },
+            OP_FILE_START => Payload::FileStart {
+                id: d.u64()?,
+                seq: d.u64()?,
+            },
+            OP_COPY => Payload::Copy {
+                id: d.u64()?,
+                start: d.u64()?,
+                len: d.u64()?,
             },
             OP_SHUTDOWN => Payload::Shutdown {
                 id: d.u64()?,
@@ -832,6 +983,7 @@ mod tests {
     fn payload_roundtrip() {
         let p = Payload::Entry {
             id: 9,
+            seq: 4,
             rel: "d/f".into(),
             kind: ENTRY_FILE,
             size: 12,
@@ -840,6 +992,54 @@ mod tests {
             sha256: [3u8; 32],
         };
         assert_eq!(p, Payload::decode(&p.encode()).unwrap());
+    }
+
+    #[test]
+    fn transfer_payloads_roundtrip() {
+        let payloads = vec![
+            Payload::Mkdir {
+                id: 1,
+                rel: "sub".into(),
+                mode: 0o755,
+            },
+            Payload::FileBegin {
+                id: 1,
+                seq: 2,
+                rel: "sub/f".into(),
+                size: 1 << 20,
+                mode: 0o644,
+                sha256: [5u8; 32],
+            },
+            Payload::ManifestEnd { id: 1, files: 3 },
+            Payload::FilePlan {
+                id: 1,
+                seq: 2,
+                action: PLAN_DELTA,
+                block_size: 8192,
+                block_count: 128,
+            },
+            Payload::FileSigs {
+                id: 1,
+                seq: 2,
+                first: 819,
+                sigs: vec![7u8; 40],
+            },
+            Payload::PlanEnd { id: 1 },
+            Payload::FileStart { id: 1, seq: 2 },
+            Payload::Copy {
+                id: 1,
+                start: 4096,
+                len: 8192,
+            },
+            Payload::FileEnd {
+                id: 1,
+                sha256: [9u8; 32],
+            },
+        ];
+        for p in payloads {
+            assert_eq!(p, Payload::decode(&p.encode()).unwrap());
+            assert_eq!(Payload::peek_id(&p.encode()), Some(1));
+        }
     }
 
     #[test]
@@ -864,6 +1064,7 @@ mod tests {
     fn peek_id_works() {
         let p = Payload::FileEnd {
             id: 0x1122334455667788,
+            sha256: [0u8; 32],
         };
         assert_eq!(Payload::peek_id(&p.encode()), Some(0x1122334455667788));
     }
