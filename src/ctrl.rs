@@ -319,6 +319,131 @@ fn print_exec_error(opts: &ExecOptions, code: u16, message: &str) {
     }
 }
 
+pub struct StopOptions {
+    pub server: String,
+    pub key: [u8; 32],
+    pub target: String,
+    pub json: bool,
+    pub timeout_secs: u64,
+    pub reason: String,
+}
+
+/// Ask one agent to end itself.  The agent answers with a final `Bye` payload
+/// and then exits its process with `Bye.code`, so a CI step that runs
+/// `apb agent` finishes successfully instead of being killed at the job
+/// timeout -- which is what lets the steps after it (a cache save, for
+/// example) still run.
+pub fn stop(opts: StopOptions) -> i32 {
+    let mut sess = match CtrlSession::connect(&opts.server, &opts.key) {
+        Ok(s) => s,
+        Err(e) => {
+            if opts.json {
+                println!(
+                    "{{\"ok\":false,\"error\":\"connect_failed\",\"detail\":{}}}",
+                    json_escape(&e.to_string())
+                );
+            } else {
+                eprintln!("apb: {e}");
+            }
+            return 3;
+        }
+    };
+    let id = sess.new_id();
+    let payload = Payload::Shutdown {
+        id,
+        reason: opts.reason.clone(),
+    };
+    if let Err(e) = sess.send_request(&opts.target, payload) {
+        eprintln!("apb: {e}");
+        sess.close();
+        return 3;
+    }
+    let deadline = Instant::now() + Duration::from_secs(opts.timeout_secs.max(1));
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if opts.json {
+                println!(
+                    "{{\"ok\":false,\"error\":\"timeout\",\"detail\":{}}}",
+                    json_escape("no reply from the agent")
+                );
+            } else {
+                eprintln!("apb: timeout waiting for the agent to end");
+            }
+            sess.close();
+            return 5;
+        }
+        match sess.recv_event(remaining) {
+            Ok(Event::Frame(Frame::RelayResult { payload, .. })) => {
+                let p = match Payload::decode(&payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("apb: bad payload: {e}");
+                        sess.close();
+                        return 3;
+                    }
+                };
+                // A peer that cannot even decode the request (an older agent,
+                // for example) answers with id 0, so route-level errors must be
+                // matched before the request-id filter.
+                if let Payload::Error { code, message, .. } = &p {
+                    if opts.json {
+                        println!(
+                            "{{\"ok\":false,\"error\":\"refused\",\"code\":{code},\"detail\":{}}}",
+                            json_escape(message)
+                        );
+                    } else {
+                        eprintln!("apb: {message}");
+                    }
+                    sess.close();
+                    return 1;
+                }
+                if p.id() != id {
+                    continue;
+                }
+                match p {
+                    Payload::Bye { code, reason, .. } => {
+                        if opts.json {
+                            println!(
+                                "{{\"ok\":true,\"ended\":true,\"code\":{code},\"reason\":{}}}",
+                                json_escape(&reason)
+                            );
+                        } else {
+                            println!("agent ended: {reason}");
+                        }
+                        sess.close();
+                        return 0;
+                    }
+                    other => {
+                        eprintln!("apb: unexpected reply {other:?}");
+                        sess.close();
+                        return 3;
+                    }
+                }
+            }
+            Ok(Event::Frame(Frame::Error { code, message })) => {
+                eprintln!("apb: server error {code}: {message}");
+                sess.close();
+                return 3;
+            }
+            Ok(Event::Frame(Frame::Ping { nonce })) => {
+                let _ = sess.conn.send_frame(&Frame::Pong { nonce });
+            }
+            Ok(Event::Frame(_)) => {}
+            Ok(Event::Closed(e)) => {
+                eprintln!("apb: {e}");
+                sess.close();
+                return 3;
+            }
+            Err(e) => {
+                eprintln!("apb: {e}");
+                sess.close();
+                return 3;
+            }
+        }
+    }
+}
+
 pub struct StatusOptions {
     pub server: String,
     pub key: [u8; 32],
