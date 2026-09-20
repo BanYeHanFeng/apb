@@ -12,6 +12,7 @@
 
 pub mod agent;
 pub mod ctrl;
+pub mod delta;
 pub mod proto;
 pub mod server;
 pub mod util;
