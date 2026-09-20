@@ -6,10 +6,11 @@ use crate::proto::{Frame, MAGIC};
 use snow::params::NoiseParams;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const MAX_WIRE: usize = 65_535;
 pub const MAX_PLAIN: usize = MAX_WIRE - 16;
@@ -164,6 +165,8 @@ fn set_keepalive(_stream: &TcpStream) {}
 struct Inner {
     stream: TcpStream,
     state: Mutex<snow::TransportState>,
+    /// Frames handed to the writer thread but not yet written to the socket.
+    pending: AtomicUsize,
 }
 
 impl Inner {
@@ -223,6 +226,7 @@ impl Conn {
         let inner = Arc::new(Inner {
             stream,
             state: Mutex::new(state),
+            pending: AtomicUsize::new(0),
         });
         let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::sync_channel(WRITE_QUEUE);
         let win = inner.clone();
@@ -230,7 +234,9 @@ impl Conn {
             .name("apb-writer".into())
             .spawn(move || {
                 while let Ok(msg) = rx.recv() {
-                    if win.send(&msg).is_err() {
+                    let ok = win.send(&msg).is_ok();
+                    win.pending.fetch_sub(1, Ordering::SeqCst);
+                    if !ok {
                         break;
                     }
                 }
@@ -244,9 +250,34 @@ impl Conn {
     }
 
     pub fn send(&self, plain: Vec<u8>) -> io::Result<()> {
-        self.tx
-            .send(plain)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection writer closed"))
+        self.inner.pending.fetch_add(1, Ordering::SeqCst);
+        match self.tx.send(plain) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.inner.pending.fetch_sub(1, Ordering::SeqCst);
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection writer closed",
+                ))
+            }
+        }
+    }
+
+    /// Wait until every frame queued so far has been written to the socket.
+    /// Returns false when the queue did not drain within `timeout`.
+    ///
+    /// `close()` shuts the socket down immediately, so without this a frame that
+    /// is still sitting in the writer queue (the final `Bye` of a shutdown, for
+    /// example) would be discarded instead of delivered.
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while self.inner.pending.load(Ordering::SeqCst) != 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
     }
 
     pub fn send_frame(&self, frame: &Frame) -> io::Result<()> {

@@ -171,6 +171,87 @@ fn loopback_exec_and_files() {
 }
 
 #[test]
+fn stop_ends_agent_process_with_zero_exit() {
+    let port = free_port();
+    let server = format!("127.0.0.1:{port}");
+    let agent = format!("apb-stop-{}", std::process::id());
+
+    let server_child = Command::new(bin())
+        .args(["serve", "--bind", &server, "--key", KEY])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _server_guard = Kill(server_child);
+    wait_port(port);
+
+    let mut agent_child = Command::new(bin())
+        .args(["agent", "--server", &server, "--key", KEY, "--name", &agent])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_status(&server, &agent);
+
+    let out = Command::new(bin())
+        .args([
+            "stop", "--server", &server, "--key", KEY, "--name", &agent, "--json", "--reason", "e2e",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stop status={:?} text={text} err={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("\"ended\":true"), "{text}");
+
+    // The point of the whole command: the agent process ends with rc 0, so the
+    // CI step running `apb agent` succeeds and the job's post steps (cache save)
+    // still run instead of being cancelled at the job timeout.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match agent_child.try_wait().unwrap() {
+            Some(s) => break s,
+            None if Instant::now() >= deadline => {
+                let _ = agent_child.kill();
+                panic!("agent did not exit after stop");
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    assert_eq!(status.code(), Some(0), "agent exit status: {status:?}");
+
+    // And the server must eventually drop it from the agent list.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = Command::new(bin())
+            .args(["status", "--server", &server, "--key", KEY, "--json"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.contains("\"count\":0") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "agent still listed: {text}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn stop_refuses_to_choose_an_agent_on_its_own() {
+    let out = Command::new(bin())
+        .args(["stop", "--server", "127.0.0.1:1", "--key", KEY])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(64));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--name"), "{stderr}");
+}
+
+#[test]
 fn config_file_supplies_server_key_and_name() {
     let port = free_port();
     let server = format!("127.0.0.1:{port}");

@@ -1,7 +1,7 @@
 //! `apb`: one binary for server, agent and controller.
 
 use apb::agent::{self, AgentOptions};
-use apb::ctrl::{self, ExecOptions, PullOptions, PushOptions, StatusOptions};
+use apb::ctrl::{self, ExecOptions, PullOptions, PushOptions, StatusOptions, StopOptions};
 use apb::util::{gen_key, hex, json_escape, parse_key};
 use std::collections::HashMap;
 use std::fs;
@@ -23,6 +23,7 @@ Usage:\n\
   apb exec   [options] -- COMMAND...\n\
   apb push   [options] LOCAL [REMOTE]\n\
   apb pull   [options] REMOTE [LOCAL]\n\
+  apb stop   [--server IP:PORT] [--key KEY] --name AGENT [--json] [--reason TEXT]\n\
   apb doctor [--server IP:PORT] [--key KEY] [--config FILE] [--json]\n\
 \n\
 Server address and --bind require an explicit port; no default port is applied.\n\
@@ -35,7 +36,11 @@ exec options:\n\
   --server A --key K --name AGENT --json --b64 --raw\n\
   --timeout SECONDS --cwd DIR --max-output BYTES\n\
 push/pull options:\n\
-  --server A --key K --name AGENT --json",
+  --server A --key K --name AGENT --json\n\
+stop options:\n\
+  --server A --key K --name AGENT --json --reason TEXT --timeout SECONDS\n\
+  stop ends the agent process (rc 0), which is what makes a CI step that runs\n\
+  `apb agent` finish green instead of being cancelled at the job timeout.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -65,6 +70,7 @@ fn main() {
         "exec" | "run" => cmd_exec(rest),
         "push" => cmd_push(rest),
         "pull" => cmd_pull(rest),
+        "stop" => cmd_stop(rest),
         "doctor" => cmd_doctor(rest),
         "version" | "--version" | "-V" => println!("apb {}", env!("CARGO_PKG_VERSION")),
         "help" | "--help" | "-h" => usage(),
@@ -386,6 +392,30 @@ fn cmd_pull(args: &[String]) -> ! {
         json,
         remote,
         local,
+    }))
+}
+
+fn cmd_stop(args: &[String]) -> ! {
+    let server = required_server(args);
+    let key = required_key(args);
+    let target = env_str(args, "--name", "APB_NAME").unwrap_or_default();
+    if target.is_empty() {
+        // Never guess here: ending the wrong node is not recoverable by retry.
+        eprintln!(
+            "apb: stop requires --name AGENT (or APB_NAME): refusing to choose an agent to end"
+        );
+        exit(64);
+    }
+    let json = has_flag(args, "--json");
+    let timeout_secs = parse_u64(args, "--timeout", "APB_TIMEOUT", 15);
+    let reason = env_or(args, "--reason").unwrap_or_default();
+    exit(ctrl::stop(StopOptions {
+        server,
+        key,
+        target,
+        json,
+        timeout_secs,
+        reason,
     }))
 }
 

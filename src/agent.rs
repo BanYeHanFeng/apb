@@ -24,6 +24,12 @@ use std::time::{Duration, Instant};
 const MAX_AGENT_NAME: usize = 128;
 const DATA_CHUNK: usize = 16 * 1024;
 const PUMP_GRACE: Duration = Duration::from_secs(2);
+/// How long the agent waits for the `Bye` reply to reach the socket.
+const BYE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// After `Bye` is on the wire, keep the process (and its TCP connection) alive
+/// briefly so the server reads and forwards the reply instead of seeing a
+/// reset connection that could discard it.
+const BYE_GRACE: Duration = Duration::from_millis(400);
 
 #[derive(Clone)]
 struct WorkerSlot {
@@ -56,15 +62,23 @@ pub fn default_name() -> String {
 
 pub fn run(opts: AgentOptions) -> io::Result<()> {
     let name = sanitize_name(&opts.name);
+    let stop = Arc::new(AtomicBool::new(false));
     let mut backoff = 1u64;
     loop {
         eprintln!("apb agent `{name}` connecting to {}", opts.server);
-        match run_once(&opts.server, &opts.key, &name) {
+        match run_once(&opts.server, &opts.key, &name, stop.clone()) {
             Ok(()) => {
                 eprintln!("apb agent `{name}` connection closed");
                 backoff = 1;
             }
             Err(e) => eprintln!("apb agent `{name}`: {e}"),
+        }
+        // A controller `Shutdown` ends the process instead of reconnecting:
+        // that is what lets the CI step running `apb agent` finish with rc 0,
+        // which in turn keeps the job green and its cache saveable.
+        if stop.load(Ordering::SeqCst) {
+            eprintln!("apb agent `{name}` ended by controller");
+            return Ok(());
         }
         thread::sleep(Duration::from_secs(backoff.min(30)));
         backoff = (backoff * 2).min(30);
@@ -110,7 +124,12 @@ fn stage<T>(label: &str, start: Instant, r: io::Result<T>) -> io::Result<T> {
     })
 }
 
-pub fn run_once(server: &str, key: &[u8; 32], name: &str) -> io::Result<()> {
+pub fn run_once(
+    server: &str,
+    key: &[u8; 32],
+    name: &str,
+    stop: Arc<AtomicBool>,
+) -> io::Result<()> {
     let started = Instant::now();
     let stage_at = Instant::now();
     let addr = stage("resolve", stage_at, crate::util::resolve_addr(server))?;
@@ -159,8 +178,14 @@ pub fn run_once(server: &str, key: &[u8; 32], name: &str) -> io::Result<()> {
     }
 
     let workers: Arc<Mutex<HashMap<u64, WorkerSlot>>> = Arc::new(Mutex::new(HashMap::new()));
-    let result = reader_loop(conn.clone(), workers.clone(), name);
+    let result = reader_loop(conn.clone(), workers.clone(), name, stop.clone());
     cancel_all(&workers);
+    if stop.load(Ordering::SeqCst) {
+        // The `Bye` reply has been written; hold the connection open a moment
+        // longer so the server reads and forwards it.  Jobs still running were
+        // cancelled above and kill their own process groups.
+        thread::sleep(BYE_GRACE);
+    }
     conn.close();
     result
 }
@@ -177,6 +202,7 @@ fn reader_loop(
     conn: Arc<Conn>,
     workers: Arc<Mutex<HashMap<u64, WorkerSlot>>>,
     name: &str,
+    stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
     loop {
         let raw = match conn.recv() {
@@ -196,7 +222,13 @@ fn reader_loop(
                             }
                         }
                     }
-                    None => spawn_worker(conn.clone(), route, payload, workers.clone()),
+                    None => spawn_worker(
+                        conn.clone(),
+                        route,
+                        payload,
+                        workers.clone(),
+                        stop.clone(),
+                    ),
                 }
             }
             Frame::RouteCancel { route } => {
@@ -213,6 +245,9 @@ fn reader_loop(
             }
             other => eprintln!("apb agent `{name}`: unexpected frame {other:?}"),
         }
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
     }
 }
 
@@ -221,6 +256,7 @@ fn spawn_worker(
     route: u64,
     initial: Vec<u8>,
     workers: Arc<Mutex<HashMap<u64, WorkerSlot>>>,
+    stop: Arc<AtomicBool>,
 ) {
     let payload = match Payload::decode(&initial) {
         Ok(p) => p,
@@ -229,6 +265,9 @@ fn spawn_worker(
             return;
         }
     };
+    if handle_shutdown(&conn, route, &payload, &stop) {
+        return;
+    }
     let id = payload.id();
     let is_start = matches!(
         payload,
@@ -267,6 +306,39 @@ fn spawn_worker(
                 m.remove(&route);
             }
         });
+}
+
+/// Handle a controller `Shutdown`: reply `Bye`, make sure that reply reached
+/// the socket, then ask the connection loop to stop.  Returns true when the
+/// payload was a lifecycle request and was consumed here.
+fn handle_shutdown(
+    conn: &Arc<Conn>,
+    route: u64,
+    payload: &Payload,
+    stop: &Arc<AtomicBool>,
+) -> bool {
+    let Payload::Shutdown { id, reason } = payload else {
+        return false;
+    };
+    let msg = if reason.trim().is_empty() {
+        "agent ending".to_string()
+    } else {
+        format!("agent ending: {reason}")
+    };
+    eprintln!("apb agent: shutdown requested ({msg})");
+    let _ = send_payload(
+        conn,
+        route,
+        Payload::Bye {
+            id: *id,
+            code: 0,
+            reason: msg,
+        },
+    );
+    let flushed = conn.flush(BYE_FLUSH_TIMEOUT);
+    eprintln!("apb agent: bye sent (flushed={flushed})");
+    stop.store(true, Ordering::SeqCst);
+    true
 }
 
 fn send_payload(conn: &Conn, route: u64, p: Payload) -> io::Result<()> {
